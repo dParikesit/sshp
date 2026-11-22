@@ -62,6 +62,15 @@ impl Fixture {
             f._dir.path(),
             &["init", "--bare", "--initial-branch=main", text(&f.origin)],
         );
+        success(f.cli(
+            &f.a,
+            &[
+                "settings",
+                "set",
+                "age-key-file",
+                text(&f.home.join("identity")),
+            ],
+        ));
         f
     }
 
@@ -103,7 +112,7 @@ impl Fixture {
         self.command(env!("CARGO_BIN_EXE_sshp"))
             .env("SSHP_REPO", repo)
             .env("SSHP_RUNTIME_DIR", self._dir.path().join("runtime"))
-            .env("FNOX_AGE_KEY_FILE", self.home.join("identity"))
+            .env("XDG_CONFIG_HOME", self.home.join("config"))
             .args(args)
             .output()
             .unwrap()

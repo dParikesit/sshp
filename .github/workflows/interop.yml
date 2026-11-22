@@ -29,7 +29,7 @@ jobs:
             brew install age
           else
             sudo apt-get update -q
-            sudo apt-get install -y age openssh-server dbus-daemon gnome-keyring
+            sudo apt-get install -y age openssh-server dbus-daemon gnome-keyring python3-dbus python3-gi
             sudo mkdir -p /run/sshd
           fi
           cd "$RUNNER_TEMP"
@@ -45,3 +45,5 @@ jobs:
       - run: python3 tests/acceptance.py
       - if: runner.os == 'Linux'
         run: bash tests/secret-service.sh
+      - if: runner.os == 'Linux'
+        run: /usr/bin/python3 tests/screen_lock.py

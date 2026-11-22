@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 pub mod agent;
 pub mod config;
 pub mod integration;
+pub mod settings;
 mod source;
 pub mod sync;
 pub mod vault;

@@ -194,24 +194,6 @@ fn read_regular(
     bounded_read(file, max, label)
 }
 
-fn identity_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("FNOX_AGE_KEY_FILE").filter(|p| !p.is_empty()) {
-        return Ok(std::path::absolute(path)?);
-    }
-    if let Some(path) = env::var_os("FNOX_CONFIG_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-    {
-        return Ok(path.join("age.txt"));
-    }
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("set FNOX_AGE_KEY_FILE to your age identity file")?;
-    Ok(base.join("fnox/age.txt"))
-}
-
 fn parse_envelope(bytes: &[u8], from_fnox_set: bool) -> Result<(Envelope, x25519::Recipient)> {
     let text = std::str::from_utf8(bytes).map_err(|_| anyhow!("invalid vault TOML encoding"))?;
     // None of the allowlisted values need '#'. Reject comments rather than
@@ -274,7 +256,7 @@ fn validate_age_header(ciphertext: &[u8]) -> Result<()> {
 }
 
 fn open_snapshot(bytes: &[u8]) -> Result<Snapshot> {
-    open_snapshot_with_identity(bytes, identity_path)
+    open_snapshot_with_identity(bytes, crate::settings::identity_path)
 }
 
 fn open_snapshot_with_identity(
@@ -283,8 +265,8 @@ fn open_snapshot_with_identity(
 ) -> Result<Snapshot> {
     let (envelope, recipient) = parse_envelope(bytes, false)?;
     let identity = identity_path()?;
-    let meta =
-        fs::metadata(&identity).context("set FNOX_AGE_KEY_FILE to your local age identity file")?;
+    let meta = fs::metadata(&identity)
+        .context("select your local identity with `sshp settings set age-key-file PATH`")?;
     ensure!(
         meta.is_file() && meta.len() <= 64 * 1024,
         "invalid age identity file"
@@ -686,6 +668,9 @@ fn resolve_fnox_key(secret: &str) -> Result<PrivateKey> {
         "external keys need a local fnox config: set SSHP_FNOX_CONFIG to an absolute file or create ~/.config/sshp/fnox.toml"
     );
     let mut cmd = Command::new(env::var_os("SSHP_FNOX_BIN").unwrap_or_else(|| "fnox".into()));
+    if let Some(identity) = crate::settings::load()?.age_key_file {
+        cmd.env("FNOX_AGE_KEY_FILE", identity);
+    }
     if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
         cmd.arg("--non-interactive")
             .stdin(Stdio::null())

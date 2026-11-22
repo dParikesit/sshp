@@ -6,7 +6,7 @@ fnox runs in the SSH connection path.
 
 ## Install
 
-Install all three executables from the [GitHub releases](https://github.com/dParikesit/sshp/releases)
+Install the CLI and agent from the [GitHub releases](https://github.com/dParikesit/sshp/releases)
 with [mise](https://mise.jdx.dev/). Prebuilt archives are available for macOS
 and Linux (glibc), on Intel/AMD x86-64 and ARM64. No Rust toolchain is needed.
 
@@ -15,7 +15,7 @@ mise use -g github:dParikesit/sshp@latest
 sshp --version
 ```
 
-With mise activated in your shell, `sshp`, `sshp-ssh` and `sshp-agent` are now
+With mise activated in your shell, `sshp` and `sshp-agent` are now
 on `PATH`. Run `mise upgrade github:dParikesit/sshp` to update. Each pushed
 commit gets its own release; commits on other branches are prereleases.
 
@@ -35,14 +35,11 @@ Runtime requirements: OpenSSH (client and agent), Git, and
 | Executable | Role |
 | --- | --- |
 | `sshp` | Vault, keys, Git, configuration management and Ratatui editor |
-| `sshp-ssh` | Direct replacement for an invocation of `/usr/bin/ssh` |
 | `sshp-agent` | Standalone user agent and lifecycle commands |
 
-The wrapper is optional: stock OpenSSH honors the same Include and agent socket.
-To select the wrapper for Git, `export GIT_SSH="$(command -v sshp-ssh)"`.
-To install it as `ssh`, symlink `sshp-ssh` to `ssh` in a personal bin directory
-ahead of `/usr/bin` on `PATH`. `scp -S /path/to/sshp-ssh` and
-`sftp -S /path/to/sshp-ssh` select it explicitly.
+Use stock OpenSSH for SSH, Git, scp and sftp. If upgrading from `sshp-ssh`,
+remove any `ssh` alias/symlink, Git SSH override, or `-S` option that points
+to the old wrapper. Keep your managed Include; it works with stock OpenSSH.
 
 ## First vault
 
@@ -52,8 +49,8 @@ be shared. Back up the identity separately. For a new identity:
 ```sh
 mkdir -p -m 700 ~/.config/sshp
 age-keygen -o ~/.config/sshp/age.txt
-export FNOX_AGE_KEY_FILE="$HOME/.config/sshp/age.txt"
-sshp init --recipient "$(age-keygen -y "$FNOX_AGE_KEY_FILE")" --remote <git-url>
+sshp settings set age-key-file ~/.config/sshp/age.txt
+sshp init --recipient "$(age-keygen -y ~/.config/sshp/age.txt)" --remote <git-url>
 ```
 
 `SSHP_REPO` selects a dedicated vault repository (default
@@ -85,12 +82,13 @@ runtime Include into the managed configuration.
 
 Protect **the existing age identity**, not `vault.toml`. The recipient stays
 the same, so the vault, its Git history and all imported SSH keys stay as they
-are. With `FNOX_AGE_KEY_FILE` pointing at your current plaintext identity,
-run this in a terminal to create a protected copy (refuses to overwrite):
+are. Set `identity` below to your current plaintext identity, then run this
+in a terminal to create a protected copy (refuses to overwrite):
 
 ```sh
-(umask 077; set -C; age -p "$FNOX_AGE_KEY_FILE" > "$FNOX_AGE_KEY_FILE.age") &&
-  export FNOX_AGE_KEY_FILE="$FNOX_AGE_KEY_FILE.age"
+identity="$HOME/.config/sshp/age.txt"
+(umask 077; set -C; age -p "$identity" > "$identity.age") &&
+  sshp settings set age-key-file "$identity.age"
 ```
 
 Run `sshp key list` and verify your existing fingerprints. To try the full
@@ -100,19 +98,12 @@ identity in memory; sshp verifies the recipient and loads the agent without
 creating a plaintext identity file. An unattended unlock with a protected
 identity fails rather than waiting for a passphrase on stdin.
 
-Once verified, persist the new `FNOX_AGE_KEY_FILE` path in your shell
-configuration and back up the protected identity separately from the vault.
+Once verified, back up the protected identity separately from the vault.
 Any remaining plaintext copy of the old identity can still open the vault
 without a passphrase. Regular SSH signing and agent lock never require the
 passphrase; management commands that reopen the vault can prompt again.
 
 ## How OpenSSH chooses settings
-
-The wrapper `exec`s `/usr/bin/ssh` with the original argument vector, file
-descriptors, environment, and terminal. It doesn't inspect hostname syntax,
-parse flags, start an agent, print a banner, or open the vault. To use a
-different installed OpenSSH, set `SSHP_OPENSSH` to its absolute executable
-path. Device/inode comparison detects a symlink or hard link back to the wrapper.
 
 With the recommended Include at the **top** of `~/.ssh/config`, the order is:
 
@@ -127,7 +118,7 @@ directives, etc. can accumulate. `-i` does **not** erase other identity files.
 An intentional managed `Host *`, global setting or `Match` can affect any
 matching connection. In the absence of such a setting or an explicit key
 assignment, sshp does not set `IdentityAgent` for other hosts and never replaces
-`SSH_AUTH_SOCK` in the wrapper. Place the Include manually at a different global
+`SSH_AUTH_SOCK` in your shell. Place the Include manually at a different global
 position if you want different precedence. Relative user-config Include paths
 resolve under `~/.ssh` per OpenSSH, **not** beside the vault; include targets
 are not automatically copied into Git.
@@ -137,6 +128,37 @@ There is no injected `-F`. An explicit `-F file` replaces the normal user config
 It sees managed entries only if that file includes them. `-F none` bypasses
 all configuration files. This also preserves option boundaries for remote
 commands, binary streams, signals, exit status and pseudo-terminal handling.
+
+## Local settings
+
+`sshp settings` prints the current machine's identity path and lock policy.
+Settings are kept in `$XDG_CONFIG_HOME/sshp/settings.toml` (normally
+`~/.config/sshp/settings.toml`), outside the encrypted vault and its Git history.
+Set them before or after cloning. `age-key-file` stores only the path; supply
+the identity itself separately on every machine. Without a saved path sshp
+looks for `$XDG_CONFIG_HOME/fnox/age.txt`. To migrate an existing environment
+setting, run `sshp settings set age-key-file "$FNOX_AGE_KEY_FILE"` once.
+
+```sh
+sshp settings set agent-lock 1h
+sshp agent stop
+sshp agent start
+sshp agent status                  # shows the policy actually running
+```
+
+* `15m` (default), `1h`, `4h`, `24h`: idle time since unlock or the last
+  successful signature. Listing identities does not reset the timer.
+* `machine-lock`: revoke keys when the desktop locks. Unlocking the screen
+  does not unlock the agent. On macOS this uses the GUI session; on Linux
+  it requires a desktop session bus with a freedesktop, GNOME, Cinnamon or
+  MATE ScreenSaver service. Screen saver activation can lock the agent early.
+  If no supported monitor is available the agent refuses to start in this mode.
+  If the Linux locker disconnects, restart the agent once the locker is back.
+* `restart`: no idle timer. Keys last for this agent process only; stopping
+  it, losing it or rebooting always requires an explicit unlock.
+
+`sshp agent lock` works in every mode. Policy changes take effect at the next
+agent start; use `--idle-timeout SECONDS` on `agent start` for a one-run override.
 
 ## Runtime and trust
 
@@ -168,16 +190,12 @@ age identity. OpenSSH config can execute programs (e.g. `Match exec`,
 
 The socket is `agent.sock` beside `managed.conf`; `sshp agent start` prints
 its path. `sshp-agent start --foreground` is suitable for a terminal or service
-supervisor. The default idle timeout is 900 seconds, measured since unlock
-or the most recent successful signature. Set it with e.g.
-`sshp-agent start --idle-timeout 300`. Listing identities doesn't keep the
-agent unlocked. The public agent interface does not accept key additions,
+supervisor. The public agent interface does not accept key additions,
 deletions or constraints. A separate same-user control socket handles explicit
 management. A watchdog cleans up on daemon death; after a power loss or
 simultaneous hard kills, `sshp agent status`, `lock`, `stop` or the next `start`
 cleans stale runtime files. For noninteractive SSH authentication in scripts
-use OpenSSH's normal `-o BatchMode=yes`; sshp itself never prompts in the
-wrapper or signing path.
+use OpenSSH's normal `-o BatchMode=yes`; signing never prompts.
 
 ## Edit and selectively export
 
@@ -286,8 +304,8 @@ are inside the encrypted payload. The portable vault itself always uses age.
 sshp status
 sshp push
 # On another machine: install sshp/fnox, provision the authorized age identity,
-# set FNOX_AGE_KEY_FILE, then:
-sshp clone <git-url>
+# then save its local path during the first clone:
+sshp clone <git-url> --age-key-file ~/.config/sshp/age.txt.age
 sshp install-config --apply
 sshp agent start
 sshp agent unlock
@@ -296,7 +314,8 @@ sshp agent unlock
 For the first clone, use HTTPS with your credential manager, a separate
 bootstrap SSH key, or an already-unlocked external agent. The vault cannot
 provide the key needed to fetch itself. Provision external provider access
-separately on each machine. Run `sshp pull` explicitly to update. Treat a
+separately on each machine. `sshp pull` reuses the saved local identity path;
+use `sshp pull --age-key-file PATH` if you moved it. Treat a
 divergence as two valuable versions: keep both, export an encrypted backup,
 and reconcile deliberately; sshp never force-pushes. For example, leave the
 diverged checkout intact, `SSHP_REPO=/absolute/new/vault sshp clone <git-url>`

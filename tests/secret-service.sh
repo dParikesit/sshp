@@ -9,15 +9,15 @@ trap 'rm -rf -- "$scratch"' EXIT
 export HOME="$scratch/home" XDG_RUNTIME_DIR="$scratch/run"
 export XDG_DATA_HOME="$HOME/data" XDG_CONFIG_HOME="$HOME/config"
 export SSHP_REPO="$scratch/vault" SSHP_RUNTIME_DIR="$scratch/agent"
-export FNOX_AGE_KEY_FILE="$HOME/identity"
 export SSHP_FNOX_CONFIG="$HOME/fnox.toml"
 mkdir -m 700 "$HOME" "$XDG_RUNTIME_DIR"
-age-keygen -o "$FNOX_AGE_KEY_FILE"
+age-keygen -o "$HOME/identity"
 ssh-keygen -q -t ed25519 -N '' -f "$HOME/key"
 dbus-run-session -- bash -eu -c '
     printf "%s" fixture | gnome-keyring-daemon --unlock --components=secrets >/dev/null
     cli="$1/sshp"
-    "$cli" init --recipient "$(age-keygen -y "$FNOX_AGE_KEY_FILE")"
+    "$cli" settings set age-key-file "$HOME/identity"
+    "$cli" init --recipient "$(age-keygen -y "$HOME/identity")"
     printf "[providers.os]\ntype = \"keychain\"\nservice = \"sshp-fixture\"\n" > "$SSHP_FNOX_CONFIG"
     fnox --no-daemon --config "$SSHP_FNOX_CONFIG" set WORK_SSH --provider os --from-file "$HOME/key"
     "$cli" key add restored --fnox-secret WORK_SSH

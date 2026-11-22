@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sshp::{Paths, agent, config, integration, sync, vault};
+use sshp::{Paths, agent, config, integration, settings, sync, vault};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(version, about = "Manage an encrypted OpenSSH vault")]
@@ -19,11 +20,25 @@ enum Cmd {
         remote: Option<String>,
     },
     /// Clone and validate an encrypted vault
-    Clone { url: String },
+    Clone {
+        url: String,
+        /// Save this machine's identity path before validating the clone
+        #[arg(long)]
+        age_key_file: Option<PathBuf>,
+    },
     /// Show local vault and upstream state
     Status,
     /// Validate and fast-forward to the remote vault
-    Pull,
+    Pull {
+        /// Save this machine's identity path before validating updates
+        #[arg(long)]
+        age_key_file: Option<PathBuf>,
+    },
+    /// Configure local preferences, even before cloning a vault
+    Settings {
+        #[command(subcommand)]
+        command: Option<settings::SettingsCommand>,
+    },
     /// Commit the encrypted vault and push without forcing
     Push,
     /// Print the runtime Include directive, or prepend it to ~/.ssh/config
@@ -63,9 +78,22 @@ fn main() -> Result<()> {
             vault::init(&p, &recipient)?;
             sync::init(&p, remote.as_deref())
         }
-        Cmd::Clone { url } => sync::clone_repo(&p, &url),
+        Cmd::Clone { url, age_key_file } => {
+            if let Some(path) = age_key_file {
+                settings::set_identity(&p, &path)?;
+            }
+            sync::clone_repo(&p, &url)
+        }
         Cmd::Status => sync::status(&p),
-        Cmd::Pull => sync::pull(&p),
+        Cmd::Pull { age_key_file } => {
+            if let Some(path) = age_key_file {
+                settings::set_identity(&p, &path)?;
+            }
+            sync::pull(&p)
+        }
+        Cmd::Settings { command } => {
+            settings::run(&p, command.unwrap_or(settings::SettingsCommand::Show))
+        }
         Cmd::Push => sync::push(&p),
         Cmd::Tui => config::tui(&p),
         Cmd::Config { command } => config::config_cmd(&p, command),

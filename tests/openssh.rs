@@ -1,59 +1,5 @@
-use std::{
-    fs,
-    os::unix::fs::symlink,
-    process::{Command, Stdio},
-};
-use tempfile::{tempdir, tempdir_in};
-
-fn wrapper() -> std::path::PathBuf {
-    // Some shell-based rustc launchers drop environment names with a dash.
-    std::path::Path::new(env!("CARGO_BIN_EXE_sshp")).with_file_name("sshp-ssh")
-}
-
-#[test]
-fn wrapper_is_transparent_without_a_vault() {
-    let tmp = tempdir().unwrap();
-    let ssh = tmp.path().join("ssh");
-    symlink(wrapper(), &ssh).unwrap();
-    let nonexistent = tmp.path().join("absent-vault");
-    for args in [
-        &["-V"][..],
-        &["-Q", "key"],
-        &["-F", "none", "-G", "invalid.example"],
-        &["-G", "unmanaged-sshp-test.invalid"],
-        &["-o", "sshp-invalid=yes"],
-        &[],
-    ] {
-        let run = |exe| {
-            Command::new(exe)
-                .args(args)
-                .stdin(Stdio::null())
-                .env_remove("SSHP_OPENSSH")
-                .env("SSHP_REPO", &nonexistent)
-                .env("SSHP_RUNTIME_DIR", &nonexistent)
-                .output()
-                .unwrap()
-        };
-        let expected = run(std::path::Path::new("/usr/bin/ssh"));
-        assert_eq!(run(&ssh), expected, "ssh {args:?}");
-        assert!(!nonexistent.exists());
-    }
-}
-
-#[test]
-fn recursion_via_hardlink_is_rejected() {
-    let tmp = tempdir_in(wrapper().parent().unwrap()).unwrap();
-    let hardlink = tmp.path().join("ssh");
-    fs::hard_link(wrapper(), &hardlink).unwrap();
-    let result = Command::new(wrapper())
-        .env("SSHP_OPENSSH", hardlink)
-        .arg("-V")
-        .output()
-        .unwrap();
-    assert_eq!(result.status.code(), Some(126));
-    assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("this wrapper"));
-}
+use std::{fs, process::Command};
+use tempfile::tempdir;
 
 #[test]
 fn native_include_preserves_user_bytes_and_openssh_precedence() {
@@ -88,11 +34,7 @@ fn native_include_preserves_user_bytes_and_openssh_precedence() {
     )
     .unwrap();
     let g = |args: &[&str]| {
-        let r = Command::new(wrapper())
-            .env_remove("SSHP_OPENSSH")
-            .args(args)
-            .output()
-            .unwrap();
+        let r = Command::new("/usr/bin/ssh").args(args).output().unwrap();
         assert!(r.status.success(), "{r:?}");
         String::from_utf8(r.stdout).unwrap()
     };

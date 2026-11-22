@@ -7,7 +7,12 @@
 //! next start or non-running status/lock/stop scrubs stale files under the lock.
 //! The daemon.lock inode is deliberately retained, with no pid or key contents.
 
-use crate::{Identity, Paths, vault};
+mod screen;
+use crate::{
+    Identity, Paths,
+    settings::{self, AgentLock},
+    vault,
+};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 use ssh_key::{PrivateKey, PublicKey, private::KeypairData};
@@ -41,7 +46,6 @@ const BACKEND_DIR: &str = ".backend";
 const LOCK_FILE: &str = "daemon.lock";
 const CONFIG_TMP: &str = ".managed.tmp";
 const IDENTITY_DIR: &str = "identities";
-const DEFAULT_IDLE: u64 = 900;
 const STARTUP: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -75,10 +79,10 @@ pub enum AgentCommand {
         /// Remain attached to the terminal
         #[arg(long, short = 'f')]
         foreground: bool,
-        /// Lock this many seconds after unlock or the last successful signature
-        #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_IDLE,
+        /// Override the saved lock policy for this run with an idle timeout
+        #[arg(long, value_name = "SECONDS",
             value_parser = clap::value_parser!(u64).range(1..))]
-        idle_timeout: u64,
+        idle_timeout: Option<u64>,
     },
     /// Show the agent's run and lock state
     Status,
@@ -107,7 +111,7 @@ fn dispatch(p: &Paths, command: AgentCommand, prefix: &[&str]) -> Result<()> {
         AgentCommand::Start {
             foreground: true,
             idle_timeout,
-        } => serve(p, prefix, Duration::from_secs(idle_timeout)),
+        } => serve(p, prefix, idle_timeout),
         AgentCommand::Start {
             foreground: false,
             idle_timeout,
@@ -188,7 +192,7 @@ fn detach(command: &mut Command) {
     }
 }
 
-fn start_background(p: &Paths, prefix: &[&str], idle: u64) -> Result<()> {
+fn start_background(p: &Paths, prefix: &[&str], idle: Option<u64>) -> Result<()> {
     let control = p.runtime.join(CONTROL_SOCKET);
     if connect(&control)?.is_some() {
         println!("agent already running");
@@ -196,8 +200,20 @@ fn start_background(p: &Paths, prefix: &[&str], idle: u64) -> Result<()> {
     }
     let mut log = tempfile::tempfile()?;
     let mut command = child_command(p, prefix)?;
+    for name in [
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.args(["start", "--foreground"]);
+    if let Some(idle) = idle {
+        command.args(["--idle-timeout", &idle.to_string()]);
+    }
     command
-        .args(["start", "--foreground", "--idle-timeout", &idle.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log.try_clone()?);
@@ -426,7 +442,38 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn serve(p: &Paths, prefix: &[&str], idle: Duration) -> Result<()> {
+enum Policy {
+    Idle(Duration),
+    Machine(screen::Screen),
+    Restart,
+}
+
+impl Policy {
+    fn ticket(&self) -> Result<u64> {
+        match self {
+            Self::Machine(screen) => screen.ticket(),
+            _ => Ok(0),
+        }
+    }
+
+    fn expired(&self, unlocked: &Unlocked) -> bool {
+        match self {
+            Self::Idle(d) => unlocked.activity.lock().unwrap().elapsed() >= *d,
+            Self::Machine(screen) => screen.ticket().ok() != Some(unlocked.ticket),
+            Self::Restart => false,
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Idle(d) => format!("{}s idle", d.as_secs()),
+            Self::Machine(_) => "machine-lock".into(),
+            Self::Restart => "restart".into(),
+        }
+    }
+}
+
+fn serve(p: &Paths, prefix: &[&str], idle: Option<u64>) -> Result<()> {
     install_signals()?;
     disable_core_dumps()?;
     let lock = open_lock(p)?;
@@ -436,6 +483,23 @@ fn serve(p: &Paths, prefix: &[&str], idle: Duration) -> Result<()> {
     );
     scrub(p)?;
     let _runtime = Runtime(p);
+    let mut monitor = None;
+    let policy = if let Some(seconds) = idle {
+        Policy::Idle(Duration::from_secs(seconds))
+    } else {
+        match settings::load()?.agent_lock {
+            AgentLock::MachineLock => {
+                let screen = screen::Screen::default();
+                monitor = Some(screen::Monitor::start(screen.clone())?);
+                Policy::Machine(screen)
+            }
+            AgentLock::Restart => Policy::Restart,
+            AgentLock::Minutes15 => Policy::Idle(Duration::from_secs(900)),
+            AgentLock::Hour1 => Policy::Idle(Duration::from_secs(3600)),
+            AgentLock::Hours4 => Policy::Idle(Duration::from_secs(4 * 3600)),
+            AgentLock::Hours24 => Policy::Idle(Duration::from_secs(24 * 3600)),
+        }
+    };
     let backend_dir = p.runtime.join(BACKEND_DIR);
     fs::create_dir(&backend_dir)?;
     fs::set_permissions(&backend_dir, Permissions::from_mode(0o700))?;
@@ -478,7 +542,7 @@ fn serve(p: &Paths, prefix: &[&str], idle: Duration) -> Result<()> {
     let control = bind(&p.runtime.join(CONTROL_SOCKET))?;
     let state = Arc::new(Server {
         paths: p.clone(),
-        idle,
+        policy,
         backend,
         closing: AtomicBool::new(false),
         stopping: AtomicBool::new(false),
@@ -489,10 +553,16 @@ fn serve(p: &Paths, prefix: &[&str], idle: Duration) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut health = Instant::now();
         while !SIGNALLED.load(Ordering::Relaxed) && !state.stopping.load(Ordering::Acquire) {
+            if let Some(monitor) = &mut monitor {
+                monitor.tick();
+            }
             accept(&control, &state, &control_workers, 8, control_client)?;
             accept(&agent, &state, &agent_workers, 64, agent_client)?;
             if let Ok(mut inner) = state.state.try_write()
-                && inner.unlocked.as_ref().is_some_and(|u| u.expired(idle))
+                && inner
+                    .unlocked
+                    .as_ref()
+                    .is_some_and(|u| state.policy.expired(u))
             {
                 state.lock(&mut inner)?;
             }
@@ -637,20 +707,15 @@ struct State {
 }
 
 struct Unlocked {
+    ticket: u64,
     types: HashMap<Vec<u8>, KeyType>,
     identity_reply: Vec<u8>,
     activity: Mutex<Instant>,
 }
 
-impl Unlocked {
-    fn expired(&self, idle: Duration) -> bool {
-        self.activity.lock().unwrap().elapsed() >= idle
-    }
-}
-
 struct Server {
     paths: Paths,
-    idle: Duration,
+    policy: Policy,
     backend: PathBuf,
     closing: AtomicBool,
     stopping: AtomicBool,
@@ -678,14 +743,18 @@ impl Server {
         if state
             .unlocked
             .as_ref()
-            .is_some_and(|u| u.expired(self.idle))
+            .is_some_and(|u| self.policy.expired(u))
         {
             self.lock(&mut state)?;
         }
-        Ok(match &state.unlocked {
+        let status = match &state.unlocked {
             Some(u) => format!("agent running (unlocked, {} identities)", u.types.len()),
             None => "agent running (locked)".into(),
-        })
+        };
+        Ok(format!(
+            "{status}; auto-lock: {}",
+            self.policy.description()
+        ))
     }
 
     fn lock(&self, state: &mut State) -> Result<()> {
@@ -713,8 +782,16 @@ impl Server {
         );
         let request = parse_unlock(input)?;
         self.lock(state)?;
+        let ticket = self.policy.ticket()?;
         let mut backend = self.backend()?;
-        let loaded = load_snapshot(&self.paths, &mut backend, request);
+        let loaded = load_snapshot(&self.paths, &mut backend, request).and_then(|mut u| {
+            u.ticket = ticket;
+            ensure!(
+                !self.policy.expired(&u),
+                "lock policy expired during unlock"
+            );
+            Ok(u)
+        });
         match loaded {
             Ok(unlocked) => {
                 let count = unlocked.types.len();
@@ -727,6 +804,7 @@ impl Server {
                     self.stopping.store(true, Ordering::Release);
                 }
                 let _ = remove_file(&self.paths.runtime.join(CONFIG_TMP));
+                let _ = remove_file(&self.paths.managed_config());
                 let _ = remove_dir(&self.paths.runtime.join(IDENTITY_DIR));
                 Err(err)
             }
@@ -807,7 +885,7 @@ fn agent_client(mut socket: UnixStream, server: &Server) -> Result<()> {
                 same_generation
                     && !server.closing.load(Ordering::Acquire)
                     && !server.stopping.load(Ordering::Acquire)
-                    && !u.expired(server.idle)
+                    && !server.policy.expired(u)
             });
             if request.as_slice() == [LIST] {
                 unlocked.map_or_else(
@@ -1129,6 +1207,7 @@ fn load_snapshot(p: &Paths, backend: &mut UnixStream, snapshot: Snapshot<'_>) ->
         let _ = public_files.keep();
     }
     Ok(Unlocked {
+        ticket: 0,
         types,
         identity_reply,
         activity: Mutex::new(Instant::now()),
@@ -1246,7 +1325,7 @@ mod tests {
         let server = Arc::new(Server {
             paths,
             backend,
-            idle: Duration::from_secs(30),
+            policy: Policy::Idle(Duration::from_secs(30)),
             closing: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             state: RwLock::new(State::default()),

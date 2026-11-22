@@ -65,7 +65,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build all three executables for each revision
+      - name: Build the CLI and agent for each revision
         shell: bash
         env:
           BUILDS: ${{ needs.commits.outputs.builds }}
@@ -80,7 +80,7 @@ jobs:
             out="$RUNNER_TEMP/packages/$sha"
             mkdir -p "$out"
             tar -C "$CARGO_TARGET_DIR/$TARGET/release" \
-              -czf "$out/sshp-$TARGET.tar.gz" sshp sshp-agent sshp-ssh
+              -czf "$out/sshp-$TARGET.tar.gz" sshp sshp-agent
           done < <(jq -r '.[].sha' <<< "$BUILDS")
       - uses: actions/upload-artifact@v4
         with:

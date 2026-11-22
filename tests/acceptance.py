@@ -28,7 +28,7 @@ import time
 P = pathlib.Path
 ROOT = P(__file__).resolve().parents[1]
 BIN = P(os.environ.get("SSHP_TEST_BIN", ROOT / "target/debug")).resolve()
-CLI, WRAP = BIN / "sshp", BIN / "sshp-ssh"
+CLI = BIN / "sshp"
 USER = pwd.getpwuid(os.getuid()).pw_name
 
 
@@ -88,12 +88,12 @@ Subsystem sftp internal-sftp
             proc.terminate()
 
 
-def client_env(directory, tools, identity, runtime):
+def client_env(directory, tools, runtime):
     directory.mkdir()
     return {
         "HOME": str(directory), "PATH": str(tools) + os.pathsep + os.environ["PATH"],
         "SSHP_RUNTIME_DIR": str(runtime), "SSHP_REPO": str(directory / "vault"),
-        "FNOX_AGE_KEY_FILE": str(identity), "SSH_ASKPASS_REQUIRE": "never",
+        "SSH_ASKPASS_REQUIRE": "never",
         "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
         "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -154,7 +154,8 @@ def protected_unlock(env, d, identity, age_keygen):
     age = P(shutil.which(str(age_keygen))).resolve().with_name("age")
     assert answer_prompts([age, "-p", "-o", wrapped, identity], env,
                           [b"enter passphrase", b"confirm passphrase"], phrase) == 0
-    protected = {**env, "FNOX_AGE_KEY_FILE": str(wrapped)}
+    run(CLI, "settings", "set", "age-key-file", wrapped, env=env)
+    protected = env
     sock = P(env["SSHP_RUNTIME_DIR"]) / "agent.sock"
     config = sock.with_name("managed.conf")
     client = {**protected, "SSH_AUTH_SOCK": str(sock)}
@@ -174,6 +175,7 @@ def protected_unlock(env, d, identity, age_keygen):
     run(CLI, "agent", "lock", env=protected)
     assert not config.exists()
     assert run("ssh-add", "-T", d / "assigned.pub", env=client, code=None).returncode
+    run(CLI, "settings", "set", "age-key-file", identity, env=env)
 
 
 def agent_packet(sock, request):
@@ -229,21 +231,21 @@ def edit_alias(env):
 def transports(d, env, file, alias, native_login):
     assigned = fingerprint(d / "assigned.pub").encode()
     unrelated = fingerprint(d / "unrelated.pub").encode()
-    trace = run(WRAP, "-vv", "-F", file, alias, "exit", "43", env=env, code=43).stderr
+    trace = run("ssh", "-vv", "-F", file, alias, "exit", "43", env=env, code=43).stderr
     offers = [l for l in trace.splitlines() if b"Offering public key:" in l]
     assert any(assigned in l for l in offers) and not any(unrelated in l for l in offers), offers
     assert unrelated not in trace, "the unrelated key entered OpenSSH's identity selection"
     quoted = "spaces, 'quotes', $dollar; and *"
     args = ["printf", "'%s'", shlex.quote(quoted)]
-    assert run(WRAP, "-F", file, alias, *args, env=env).stdout == quoted.encode()
+    assert run("ssh", "-F", file, alias, *args, env=env).stdout == quoted.encode()
     blob = bytes(range(256)) * 1024
     original = d / "binary"
     original.write_bytes(blob)
     remote = d / "scp-copy"
-    run("scp", "-S", WRAP, "-F", file, original, f"{alias}:{remote}", env=env)
+    run("scp", "-F", file, original, f"{alias}:{remote}", env=env)
     assert remote.read_bytes() == blob
     target = d / "sftp-copy"
-    run("sftp", "-S", WRAP, "-F", file, "-b", "-", alias, env=env,
+    run("sftp", "-F", file, "-b", "-", alias, env=env,
         data=f'get "{remote}" "{target}"\n'.encode())
     assert target.read_bytes() == blob
     work = d / "git-fixture"
@@ -253,14 +255,13 @@ def transports(d, env, file, alias, native_login):
     run("git", "-C", work, "commit", "-qm", "fixture", env=env)
     checkout = d / "via-ssh"
     run("git", "clone", "-q", f"{alias}:{work}", checkout, env={
-        **env, "GIT_SSH_COMMAND": f"{shlex.quote(str(WRAP))} -F {shlex.quote(str(file))}",
+        **env, "GIT_SSH_COMMAND": f"ssh -F {shlex.quote(str(file))}",
     })
     assert (checkout / "payload").read_bytes() == blob
     if native_login:
         # Caller provisions the real login account's ~/.ssh/config with an
         # Include pointing to the fixture; the test itself never changes it.
-        ssh_path = d / "tools/ssh"
-        ssh_path.symlink_to(WRAP)
+        ssh_path = "ssh"
         computed = run(ssh_path, "-vvG", "-p", "2222", alias, env=env)
         assert b"port 2222\n" in computed.stdout and b"hostname 127.0.0.1\n" in computed.stdout
         if P("/etc/ssh/ssh_config").exists():
@@ -271,7 +272,7 @@ def transports(d, env, file, alias, native_login):
             ssh_path, "-G", "unmanaged.invalid", env=env).stdout
         assert run(ssh_path, alias, "printf", "native", env=env).stdout == b"native"
         remote_head = run("git", "ls-remote", f"{alias}:{work}", "HEAD",
-                          env={**env, "GIT_SSH": str(ssh_path)}).stdout.split()[0]
+                          env=env).stdout.split()[0]
         assert remote_head == run("git", "-C", work, "rev-parse", "HEAD", env=env).stdout.strip()
 
 
@@ -290,7 +291,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent-only", action="store_true", help="omit live sshd and transfer checks")
     parser.add_argument("--native-login", action="store_true",
-                        help="also test bare ssh ALIAS and GIT_SSH; requires a disposable login "
+                        help="also test bare ssh ALIAS and default Git transport; requires a disposable login "
                              "with Include /ABSOLUTE/HOME/.sshp-e2e/sshp-*/first/.ssh/config")
     args = parser.parse_args()
     os.umask(0o077)
@@ -310,7 +311,8 @@ def main():
         keys(d)
         with contextlib.ExitStack() as cleanup:
             port = 22 if args.agent_only else cleanup.enter_context(sshd(d))
-            env = client_env(d / "first", tools, identity, d / "r1")
+            env = client_env(d / "first", tools, d / "r1")
+            run(CLI, "settings", "set", "age-key-file", identity, env=env)
             alias = "sshp-example-hidden"
             remote = d / "sync.git"
             run("git", "init", "--bare", "-q", remote, env=env)
@@ -352,7 +354,8 @@ Match originalhost another.invalid
             run(CLI, "key", "import", "other", d / "unrelated", env=env)
             backup = d / "portable-backup"
             run(CLI, "vault", "export", backup, env=env)
-            restored = client_env(d / "restored", tools, identity, d / "r4")
+            restored = client_env(d / "restored", tools, d / "r4")
+            run(CLI, "settings", "set", "age-key-file", identity, env=restored)
             run(CLI, "vault", "import", backup, env=restored)
             assert run(CLI, "config", "export", env=restored).stdout == expected
             assert not (P(restored["SSHP_REPO"]) / ".git").exists()
@@ -392,8 +395,10 @@ Match originalhost another.invalid
             run(CLI, "push", env=env)
             inspect_history(remote, [alias.encode(), b"HostName 127.0.0.1", b"fixture-assigned",
                                      b"OPENSSH PRIVATE KEY", (d/"assigned").read_bytes().splitlines()[2]], env)
-            env2 = client_env(d / "second", tools, identity, d / "r2")
-            run(CLI, "clone", remote, env=env2)
+            env2 = client_env(d / "second", tools, d / "r2")
+            second_key = d / "second/identity"
+            shutil.copyfile(identity, second_key)
+            run(CLI, "clone", remote, "--age-key-file", second_key, env=env2)
             run(CLI, "install-config", "--apply", env=env2)
             run(BIN / "sshp-agent", "start", "--idle-timeout", "2", env=env2)
             cleanup.callback(run, BIN / "sshp-agent", "stop", env=env2, code=None)
@@ -403,7 +408,7 @@ Match originalhost another.invalid
                 list(pool.map(lambda name: run("ssh-add", "-T", d / name, env=ordinary),
                               ["assigned.pub", "unrelated.pub"] * 3))
             if not args.agent_only:
-                run(WRAP, "-F", d / "second/.ssh/config", alias, "true", env=env2)
+                run("ssh", "-F", d / "second/.ssh/config", alias, "true", env=env2)
             time.sleep(2.2)
             assert not (d / "r2/managed.conf").exists(), "idle lock left configuration published"
             assert run("ssh-add", "-T", d / "assigned.pub", env=ordinary, code=None).returncode
@@ -433,9 +438,15 @@ end }
             run(CLI, "push", env=available)
             inspect_history(remote, [b"WORK_SSH", b"fixture-item", b"external-host", b"OPENSSH PRIVATE KEY",
                                      (d / "external").read_bytes().splitlines()[2]], env)
-            env3 = client_env(d / "third", tools, identity, d / "r3")
-            run(CLI, "clone", remote, env=env3)
+            run(CLI, "pull", env=env2)
+            env3 = client_env(d / "third", tools, d / "r3")
+            run(CLI, "clone", remote, "--age-key-file", identity, env=env3)
+            # A stale pre-upgrade shell export cannot override the saved path,
+            # even when fnox uses age for an external secret.
+            env3["FNOX_AGE_KEY_FILE"] = str(d / "nonexistent-old-path")
+            run(CLI, "settings", "set", "agent-lock", "restart", env=env3)
             run(CLI, "agent", "start", env=env3)
+            assert b"auto-lock: restart" in run(CLI, "agent", "status", env=env3).stdout
             cleanup.callback(run, CLI, "agent", "stop", env=env3, code=None)
             # Clone/list do not require the external provider. Unlock does.
             missing = run(CLI, "agent", "unlock", env=env3, code=None)
@@ -443,7 +454,7 @@ end }
             # The same logical secret may use a different backend on another
             # machine. Build a real encrypted fnox config, using the default path.
             cfg = P(env3["HOME"]) / ".config/sshp/fnox.toml"
-            cfg.parent.mkdir(parents=True)
+            cfg.parent.mkdir(parents=True, exist_ok=True)
             cfg.write_text(f'[providers.other]\ntype = "age"\nrecipients = ["{recipient}"]\n')
             store = [tools / "fnox", "--no-daemon", "--config", cfg, "set", "WORK_SSH",
                      "--provider", "other", "--from-file"]
@@ -457,17 +468,22 @@ end }
             run(CLI, "agent", "unlock", env=env3)
             cfg.rename(cfg.with_suffix(".offline"))
             run("ssh-add", "-T", d / "external.pub", env={**env3, "SSH_AUTH_SOCK": str(d/"r3/agent.sock")})
+            run(CLI, "agent", "stop", env=env3)
+            run(CLI, "agent", "start", env=env3)
+            assert b"(locked); auto-lock: restart" in run(CLI, "agent", "status", env=env3).stdout
+            assert not (d / "r3/managed.conf").exists()
             cfg.with_suffix(".offline").rename(cfg)
             # A pre-upgrade vault may have both embedded and old provider
             # records. Registration must preserve labels/hosts and require the
             # same key, without executing its old backend configuration.
             vf = P(restored["SSHP_REPO"]) / "vault.toml"
             vault_fnox = [tools / "fnox", "--no-daemon", "--config", vf]
-            record = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=restored).stdout)
+            direct_fnox = {**restored, "FNOX_AGE_KEY_FILE": str(identity)}
+            record = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=direct_fnox).stdout)
             record.update(version=1, providers={"old": {"type":"keychain","service":"fixture"}})
             record["keys"]["other"]["source"] = {"type":"provider","provider":"old","reference":"existing"}
             record["keys"]["other"]["hosts"] = ["legacy-alias"]
-            run(*vault_fnox, "set", "SSHP_VAULT", "--provider", "age", env=restored,
+            run(*vault_fnox, "set", "SSHP_VAULT", "--provider", "age", env=direct_fnox,
                 data=json.dumps(record).encode())
             assert b"legacy (needs key relink)" in run(CLI, "key", "list", env=restored).stdout
             restore_cfg = {**restored, "SSHP_FNOX_CONFIG": str(cfg)}
@@ -478,7 +494,7 @@ end }
             run(CLI, "key", "relink", "other", "--fnox-secret", "WORK_SSH", env=restore_cfg)
             migrated = run(CLI, "key", "list", env=restore_cfg).stdout
             assert b"external (fnox)\tlegacy-alias" in migrated and b"encrypted in Git (age)" in migrated
-            updated = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=restored).stdout)
+            updated = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=direct_fnox).stdout)
             assert updated["version"] == 2 and "providers" not in updated
             assert updated["keys"]["other"]["source"] == {"type":"fnox","secret":"WORK_SSH"}
             assert run(CLI, "config", "export", env=restore_cfg).stdout == expected
