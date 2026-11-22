@@ -16,10 +16,18 @@ sshp --version
 ```
 
 With mise activated in your shell, `sshp`, `sshp-ssh` and `sshp-agent` are now
-on `PATH`. Run `mise upgrade github:dParikesit/sshp` to update, or pin a build
-by replacing `latest` with its release tag without the leading `v`.
-Each pushed commit gets its own release; commits on other branches are
-prereleases, and `latest` follows the default branch.
+on `PATH`. Run `mise upgrade github:dParikesit/sshp` to update. Each pushed
+commit gets its own release; commits on other branches are prereleases.
+
+mise's minimum release age can delay `@latest` (24 hours by default). To
+install the newest default-branch release immediately, pin its exact version
+from [Releases](https://github.com/dParikesit/sshp/releases/latest), omitting
+the leading `v`. With the GitHub CLI:
+
+```sh
+tag=$(gh release view --repo dParikesit/sshp --json tagName --jq .tagName)
+mise use -g "github:dParikesit/sshp@${tag#v}"
+```
 
 Runtime requirements: OpenSSH (client and agent), Git, and
 [fnox](https://fnox.jdx.dev) (tested with 1.50). Install `age` for `age-keygen`.
