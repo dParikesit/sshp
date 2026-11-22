@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import errno
 import fcntl
+import json
 import os
 import pathlib
 import pty
@@ -102,6 +103,77 @@ def client_env(directory, tools, identity, runtime):
 
 def fingerprint(pub):
     return run("ssh-keygen", "-lf", pub).stdout.decode().split()[1]
+
+
+def answer_prompts(argv, env, prompts, reply, retry_prompt=None):
+    """Drive the real age/fnox password prompts without a passphrase in argv or env."""
+    pid, term = pty.fork()
+    if pid == 0:
+        os.execvpe(str(argv[0]), list(map(str, argv)), env)
+    pending = list(prompts)
+    output = b""
+    deadline = time.monotonic() + 45
+    try:
+        while time.monotonic() < deadline:
+            if not select.select([term], [], [], .2)[0]:
+                continue
+            try:
+                chunk = os.read(term, 8192)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                break
+            if not chunk:
+                break
+            output += chunk
+            if pending and pending[0] in output.lower():
+                pending.pop(0)
+                os.write(term, reply + b"\n")
+                output = b""
+            elif not pending and retry_prompt and retry_prompt in output.lower():
+                os.write(term, reply + b"\n")
+                retry_prompt = None
+                output = b""
+        else:
+            raise AssertionError("terminal command did not finish after expected prompts")
+        _, status = os.waitpid(pid, 0)
+        pid = 0
+        assert not pending, f"terminal command exited before prompt {pending}"
+        return os.waitstatus_to_exitcode(status)
+    finally:
+        if pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        os.close(term)
+
+
+def protected_unlock(env, d, identity, age_keygen):
+    wrapped = d / "protected.age"
+    phrase = b"disposable fixture passphrase"
+    age = P(shutil.which(str(age_keygen))).resolve().with_name("age")
+    assert answer_prompts([age, "-p", "-o", wrapped, identity], env,
+                          [b"enter passphrase", b"confirm passphrase"], phrase) == 0
+    protected = {**env, "FNOX_AGE_KEY_FILE": str(wrapped)}
+    sock = P(env["SSHP_RUNTIME_DIR"]) / "agent.sock"
+    config = sock.with_name("managed.conf")
+    client = {**protected, "SSH_AUTH_SOCK": str(sock)}
+    cli = [CLI, "agent", "unlock"]
+    vault_file = P(env["SSHP_REPO"]) / "vault.toml"
+    before = vault_file.read_bytes()
+    run(CLI, "agent", "lock", env=env)
+    assert run(*cli, env=protected, code=None).returncode, "headless unlock must fail"
+    prompt = b"passphrase for age identity"
+    assert answer_prompts(cli, protected, [prompt], b"incorrect", retry_prompt=prompt) != 0
+    assert not config.exists()
+    assert run("ssh-add", "-T", d / "assigned.pub", env=client, code=None).returncode
+    assert answer_prompts(cli, protected, [b"passphrase for age identity"], phrase) == 0
+    assert config.exists() and before == vault_file.read_bytes()
+    wrapped.unlink()  # Subsequent signing and locking cannot reopen this identity.
+    run("ssh-add", "-T", d / "assigned.pub", env=client)
+    run(CLI, "agent", "lock", env=protected)
+    assert not config.exists()
+    assert run("ssh-add", "-T", d / "assigned.pub", env=client, code=None).returncode
 
 
 def agent_packet(sock, request):
@@ -291,6 +363,7 @@ Match originalhost another.invalid
             run(CLI, "install-config", "--apply", env=env)
             run(CLI, "agent", "start", env=env)
             cleanup.callback(run, CLI, "agent", "stop", env=env, code=None)
+            protected_unlock(env, d, identity, age)
             run(CLI, "agent", "unlock", env=env)
             sock = str(d / "r1/agent.sock")
             client = {**env, "SSH_AUTH_SOCK": sock}
@@ -334,48 +407,84 @@ Match originalhost another.invalid
             time.sleep(2.2)
             assert not (d / "r2/managed.conf").exists(), "idle lock left configuration published"
             assert run("ssh-add", "-T", d / "assigned.pub", env=ordinary, code=None).returncode
-            # Real fnox Bitwarden provider with a fixture bw CLI in place of a
-            # personal account. The backing key is never included in the vault.
+            # The client reads a named secret from a native fnox config. The
+            # profile, provider, credentials and backing key stay on this machine.
             run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", d / "external")
-            bw = tools / "bw"
-            bw.write_text(f"""#!{sys.executable}
-import sys, pathlib
-args = sys.argv[1:]
-if 'get' in args and 'password' in args and 'fixture-item' in args:
-    print(pathlib.Path({str(d/'external')!r}).read_text(), end='')
-else:
-    sys.exit(1)
+            (d / "fixture.lua").write_text("""
+return { get = function(ctx, ref)
+    if ref ~= 'fixture-item' or os.getenv('FIXTURE_SESSION') ~= 'fixture-only' then return nil end
+    local f = assert(io.open(ctx.options.path, 'rb'))
+    local key = f:read('*a')
+    f:close()
+    return key
+end }
 """)
-            bw.chmod(0o700)
-            available = {**env, "BW_SESSION": "fixture-not-a-real-session"}
-            run(CLI, "vault", "provider", "set-bitwarden", "pwmanager", env=available)
-            run(CLI, "key", "add", "ext", "--provider", "pwmanager", "--reference-stdin",
-                data=b"fixture-item\n", env=available)
+            external_config = d / "fnox-client.toml"
+            external_config.write_text('[providers.manager]\ntype = "lua"\nplugin = "./fixture.lua"\n'
+                                       f'options = {{ path = "{d}/external" }}\n'
+                                       '[profiles.fixture.secrets.WORK_SSH]\nprovider = "manager"\n'
+                                       'value = "fixture-item"\nenv = false\n')
+            available = {**env, "FIXTURE_SESSION": "fixture-only",
+                         "FNOX_PROFILE": "fixture", "SSHP_FNOX_CONFIG": str(external_config)}
+            run(CLI, "key", "add", "ext", "--fnox-secret", "WORK_SSH", env=available)
             run(CLI, "key", "associate", "ext", "external-host", env=available)
             sources = run(CLI, "key", "list", env=available).stdout
-            assert b"encrypted in Git (age)" in sources and b"external provider (bitwarden)" in sources
+            assert b"encrypted in Git (age)" in sources and b"external (fnox)" in sources
             run(CLI, "push", env=available)
-            inspect_history(remote, [b"fixture-item", b"external-host", b"OPENSSH PRIVATE KEY",
+            inspect_history(remote, [b"WORK_SSH", b"fixture-item", b"external-host", b"OPENSSH PRIVATE KEY",
                                      (d / "external").read_bytes().splitlines()[2]], env)
             env3 = client_env(d / "third", tools, identity, d / "r3")
             run(CLI, "clone", remote, env=env3)
             run(CLI, "agent", "start", env=env3)
             cleanup.callback(run, CLI, "agent", "stop", env=env3, code=None)
-            # Simulate an unreachable password manager, not merely an unset
-            # environment variable (some clients cache a session).
-            bw.rename(tools / "bw-available")
-            bw.write_text("#!/bin/sh\nexit 1\n")
-            bw.chmod(0o700)
-            env3["BW_SESSION"] = "fixture-not-a-real-session"
+            # Clone/list do not require the external provider. Unlock does.
             missing = run(CLI, "agent", "unlock", env=env3, code=None)
-            assert missing.returncode and any(s in missing.stderr.lower() for s in
-                                              [b"bitwarden", b"provider"]), missing.stderr
-            (tools / "bw-available").replace(bw)
+            assert missing.returncode and b"SSHP_FNOX_CONFIG" in missing.stderr
+            # The same logical secret may use a different backend on another
+            # machine. Build a real encrypted fnox config, using the default path.
+            cfg = P(env3["HOME"]) / ".config/sshp/fnox.toml"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(f'[providers.other]\ntype = "age"\nrecipients = ["{recipient}"]\n')
+            store = [tools / "fnox", "--no-daemon", "--config", cfg, "set", "WORK_SSH",
+                     "--provider", "other", "--from-file"]
+            missing = run(CLI, "agent", "unlock", env=env3, code=None)
+            assert missing.returncode and b"fnox key lookup failed" in missing.stderr
+            run(*store, d / "unrelated", env=env3)
+            wrong = run(CLI, "agent", "unlock", env=env3, code=None)
+            assert wrong.returncode and b"pinned public key" in wrong.stderr
+            assert not (d / "r3/managed.conf").exists()
+            run(*store, d / "external", env=env3)
             run(CLI, "agent", "unlock", env=env3)
+            cfg.rename(cfg.with_suffix(".offline"))
             run("ssh-add", "-T", d / "external.pub", env={**env3, "SSH_AUTH_SOCK": str(d/"r3/agent.sock")})
+            cfg.with_suffix(".offline").rename(cfg)
+            # A pre-upgrade vault may have both embedded and old provider
+            # records. Registration must preserve labels/hosts and require the
+            # same key, without executing its old backend configuration.
+            vf = P(restored["SSHP_REPO"]) / "vault.toml"
+            vault_fnox = [tools / "fnox", "--no-daemon", "--config", vf]
+            record = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=restored).stdout)
+            record.update(version=1, providers={"old": {"type":"keychain","service":"fixture"}})
+            record["keys"]["other"]["source"] = {"type":"provider","provider":"old","reference":"existing"}
+            record["keys"]["other"]["hosts"] = ["legacy-alias"]
+            run(*vault_fnox, "set", "SSHP_VAULT", "--provider", "age", env=restored,
+                data=json.dumps(record).encode())
+            assert b"legacy (needs key relink)" in run(CLI, "key", "list", env=restored).stdout
+            restore_cfg = {**restored, "SSHP_FNOX_CONFIG": str(cfg)}
+            before = vf.read_bytes()
+            wrong = run(CLI, "key", "relink", "other", "--fnox-secret", "WORK_SSH", env=restore_cfg, code=None)
+            assert wrong.returncode and b"pinned public key" in wrong.stderr and before == vf.read_bytes()
+            run(*store, d / "unrelated", env=env3)
+            run(CLI, "key", "relink", "other", "--fnox-secret", "WORK_SSH", env=restore_cfg)
+            migrated = run(CLI, "key", "list", env=restore_cfg).stdout
+            assert b"external (fnox)\tlegacy-alias" in migrated and b"encrypted in Git (age)" in migrated
+            updated = json.loads(run(*vault_fnox, "get", "SSHP_VAULT", env=restored).stdout)
+            assert updated["version"] == 2 and "providers" not in updated
+            assert updated["keys"]["other"]["source"] == {"type":"fnox","secret":"WORK_SSH"}
+            assert run(CLI, "config", "export", env=restore_cfg).stdout == expected
             print("Passed: lossless config round trip, TUI edit, selected export, "
-                  "agent list/sign/lock/unlock/idle, encrypted Git restore"
-                  ", Bitwarden provider (fixture bw; available/unavailable)"
+                  "agent list/sign/lock/unlock/idle, passphrase-protected identity, encrypted Git restore"
+                  ", named fnox secrets across providers, missing/changed keys and v1 relink"
                   + ("" if args.agent_only else ", assigned-only sshd login, quoting/status, Git/scp/sftp"))
 
 

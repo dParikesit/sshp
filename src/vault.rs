@@ -1,11 +1,11 @@
 //! The portable vault is a single fnox age secret. We parse the small supported
-//! subset ourselves: only freshly generated configuration reaches fnox.
+//! subset ourselves. External key lookups use a separate, local fnox config.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -17,7 +17,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Subcommand;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, DeserializeOwned, MapAccess, Visitor},
+    de::{self, MapAccess, Visitor},
 };
 use ssh_key::{Algorithm, HashAlg, Kdf, LineEnding, PrivateKey, PublicKey};
 use tempfile::NamedTempFile;
@@ -26,12 +26,11 @@ use zeroize::Zeroizing;
 use crate::{Identity, Paths};
 
 const FILE: &str = "vault.toml";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_RECORD: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_VAULT: usize = 12 * 1024 * 1024;
 const MAX_CONFIG: usize = 1024 * 1024;
 const MAX_KEY: usize = 32 * 1024;
-const MAX_PROVIDER_CONFIG: usize = 16 * 1024;
 const MAX_REFERENCE: usize = 1024;
 const MAX_PASSPHRASE: usize = 4096;
 
@@ -102,8 +101,15 @@ pub struct Vault {
     version: u32,
     recipient: String,
     pub config: String,
-    #[serde(deserialize_with = "unique_map")]
-    providers: BTreeMap<String, Provider>,
+    // Inert v1 metadata: retain until its last key is explicitly relinked.
+    // Never pass imported settings, paths or commands to the local fnox resolver.
+    #[serde(
+        default,
+        rename = "providers",
+        deserialize_with = "unique_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    legacy_providers: BTreeMap<String, BTreeMap<String, Secret>>,
     #[serde(deserialize_with = "unique_map")]
     keys: BTreeMap<String, Key>,
 }
@@ -140,41 +146,6 @@ where
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
-enum Provider {
-    Bitwarden(Bitwarden),
-    Keychain(Keychain),
-}
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Bitwarden {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    backend: Option<BitwardenBackend>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    folder: Option<Secret>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    collection: Option<Secret>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    organization_id: Option<Secret>,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum BitwardenBackend {
-    Bw,
-    Rbw,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Keychain {
-    service: Secret,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prefix: Option<Secret>,
-}
-
-#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Key {
     public: String,
@@ -187,6 +158,8 @@ struct Key {
 #[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
 enum Source {
     Age { pem: Secret },
+    Fnox { secret: String },
+    // Read-only representation for migration; no legacy resolver.
     Provider { provider: String, reference: Secret },
 }
 
@@ -237,30 +210,6 @@ fn identity_path() -> Result<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .context("set FNOX_AGE_KEY_FILE to your age identity file")?;
     Ok(base.join("fnox/age.txt"))
-}
-
-fn require_matching_identity(path: &Path, recipient: &x25519::Recipient) -> Result<()> {
-    let bytes = read_regular(path, 64 * 1024, "age identity file", true)
-        .context("set FNOX_AGE_KEY_FILE to your age identity file if using a custom location")?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow!("invalid age identity file"))?;
-    let mut matched = false;
-    let recipient = recipient.to_string();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let identity = line
-            .parse::<x25519::Identity>()
-            .map_err(|_| anyhow!("identity file must contain only native age identities"))?;
-        if identity.to_public().to_string() == recipient {
-            matched = true;
-        }
-    }
-    ensure!(
-        matched,
-        "age identity file does not match the vault recipient"
-    );
-    Ok(())
 }
 
 fn parse_envelope(bytes: &[u8], from_fnox_set: bool) -> Result<(Envelope, x25519::Recipient)> {
@@ -333,17 +282,14 @@ fn open_snapshot_with_identity(
     identity_path: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<Snapshot> {
     let (envelope, recipient) = parse_envelope(bytes, false)?;
-    // Decrypt only with the local identity for the declared recipient. The outer
-    // recipient is otherwise unauthenticated and must never redirect a later save.
     let identity = identity_path()?;
-    require_matching_identity(&identity, &recipient)?;
-    let isolated = Fnox::new()?;
-    let config = toml::to_string(&envelope).map_err(|_| anyhow!("could not encode vault TOML"))?;
-    let decrypted = isolated
-        .get(config.as_bytes(), Some(&identity), MAX_RECORD + 1)
-        .context("could not decrypt the fnox age vault")?;
-    let vault: Vault = serde_json::from_slice(&decrypted)
-        .map_err(|_| anyhow!("invalid encrypted vault schema"))?;
+    let meta =
+        fs::metadata(&identity).context("set FNOX_AGE_KEY_FILE to your local age identity file")?;
+    ensure!(
+        meta.is_file() && meta.len() <= 64 * 1024,
+        "invalid age identity file"
+    );
+    let vault = Fnox::new()?.open_vault(&envelope, &recipient, &identity)?;
     ensure!(
         vault.recipient == recipient.to_string(),
         "declared age recipient does not match the encrypted vault record"
@@ -379,11 +325,11 @@ fn seal(snapshot: &Snapshot) -> Result<String> {
         ),
     )
     .context("could not initialize isolated fnox config")?;
-    let output = isolated.run(
+    let output = Fnox::run(
         isolated
             .command(&config, None)
             .args(["set", "SSHP_VAULT", "--provider", "age"]),
-        &record,
+        Some(&record),
         4096,
     );
     output.context("fnox could not encrypt the vault")?;
@@ -426,19 +372,12 @@ impl Fnox {
             .env("FNOX_AUDIT", "off")
             .env("FNOX_PROMPT_AUTH", "false")
             .env("RUST_LOG", "off")
-            .args(["--no-daemon", "--non-interactive", "--no-color", "--config"])
+            .args(["--no-daemon", "--no-color", "--config"])
             .arg(config)
             .stderr(Stdio::null());
         // PATH and HOME support shims such as mise. No fnox configuration,
         // identity contents, vault references or Debug settings are inherited.
-        for name in [
-            "PATH",
-            "HOME",
-            "USER",
-            "XDG_RUNTIME_DIR",
-            "XDG_DATA_HOME",
-            "DBUS_SESSION_BUS_ADDRESS",
-        ] {
+        for name in ["PATH", "HOME", "USER", "XDG_DATA_HOME"] {
             if let Some(value) = env::var_os(name) {
                 command.env(name, value);
             }
@@ -446,58 +385,103 @@ impl Fnox {
         if let Some(identity) = identity {
             command.env("FNOX_AGE_KEY_FILE", identity);
         }
+        if identity.is_some() && io::stdin().is_terminal() && io::stderr().is_terminal() {
+            command.stderr(Stdio::inherit());
+            if let Some(value) = env::var_os("FNOX_NON_INTERACTIVE") {
+                command.env("FNOX_NON_INTERACTIVE", value);
+            }
+        } else {
+            command.arg("--non-interactive").stdin(Stdio::null());
+        }
         command
     }
 
-    fn get(
+    fn open_vault(
         &self,
-        config: &[u8],
-        identity: Option<&Path>,
-        max: usize,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        // /dev/fd/0 reopens the anonymous input pipe on Darwin and Linux. It
-        // supplies config with private settings without ever writing it to disk.
-        self.get_command(self.command(Path::new("/dev/fd/0"), identity), config, max)
+        envelope: &Envelope,
+        recipient: &x25519::Recipient,
+        identity: &Path,
+    ) -> Result<Vault> {
+        // Anyone can encrypt a record to us while naming *their* recipient in
+        // both the manifest and its payload. Before trusting that recipient for
+        // future writes, prove fnox can decrypt a fresh message addressed to it.
+        // Resolve both records together so fnox unlocks the identity only once.
+        const CHECK: &str = "sshp recipient check";
+        let probe = age::encrypt(recipient, CHECK.as_bytes())?;
+        let mut config = toml::to_string(envelope)?;
+        config.push_str(&format!(
+            "\n[secrets.SSHP_RECIPIENT_CHECK]\nprovider = \"age\"\nenv = false\nvalue = \"{}\"\n",
+            STANDARD.encode(probe)
+        ));
+        // This private file contains ciphertext only. Leave stdin available to
+        // fnox for a terminal prompt; its plaintext stdout is a separate pipe.
+        let path = self.directory.path().join(FILE);
+        fs::write(&path, config)?;
+        let output = Self::run(
+            self.command(&path, Some(identity)).args([
+                "export",
+                "--format",
+                "json",
+                "--if-missing",
+                "error",
+                "SSHP_VAULT",
+                "SSHP_RECIPIENT_CHECK",
+            ]),
+            None,
+            2 * MAX_RECORD + 4096, // JSON escaping of the serialized record
+        ).context("could not decrypt the vault and verify its recipient; check the age identity (a protected identity needs a terminal)")?;
+        #[derive(Deserialize)]
+        struct Export {
+            secrets: Records,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        struct Records {
+            sshp_vault: Secret,
+            sshp_recipient_check: String,
+        }
+        let Export { secrets } = serde_json::from_slice(&output)
+            .map_err(|_| anyhow!("fnox did not return both requested vault records"))?;
+        ensure!(
+            secrets.sshp_recipient_check == CHECK,
+            "age identity does not match the vault recipient"
+        );
+        let record = secrets.sshp_vault.as_str();
+        ensure!(record.len() <= MAX_RECORD, "vault record is too large");
+        serde_json::from_str(record).map_err(|_| anyhow!("invalid encrypted vault schema"))
     }
 
-    fn get_command(
-        &self,
-        mut command: Command,
-        config: &[u8],
-        max: usize,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        self.run(
-            command.args(["get", "--if-missing", "error", "SSHP_VAULT"]),
-            config,
-            max,
-        )
-    }
-
-    fn run(&self, command: &mut Command, input: &[u8], max: usize) -> Result<Zeroizing<Vec<u8>>> {
+    fn run(command: &mut Command, input: Option<&[u8]>, max: usize) -> Result<Zeroizing<Vec<u8>>> {
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .context("could not start fnox (check PATH or SSHP_FNOX_BIN)")?;
-        let mut stdin = child.stdin.take().context("missing fnox stdin")?;
+        let pipe = child.stdin.take().zip(input);
         let stdout = child.stdout.take().context("missing fnox stdout")?;
         std::thread::scope(|scope| {
             // Drain stdout while sending input to avoid a pipe deadlock.
-            let writing = scope.spawn(move || stdin.write_all(input));
+            let writing =
+                pipe.map(|(mut stdin, input)| scope.spawn(move || stdin.write_all(input)));
             let output = bounded_read(stdout, max, "fnox response");
             if output.is_err() {
                 let _ = child.kill();
             }
             let status = child.wait().context("could not wait for fnox")?;
-            let written = writing
-                .join()
-                .map_err(|_| anyhow!("could not send fnox input"))?;
+            if let Some(writing) = writing {
+                writing
+                    .join()
+                    .map_err(|_| anyhow!("could not send fnox input"))?
+                    .context("could not send fnox input")?;
+            }
+            let output = output?;
             ensure!(
                 status.success(),
                 "fnox could not resolve the requested secret"
             );
-            written.context("could not send fnox input")?;
-            output
+            Ok(output)
         })
     }
 }
@@ -528,8 +512,7 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
             anyhow!("could not publish encrypted vault: {}", err.error)
         }
     })?;
-    // Publication is the commit point. A platform that doesn't support directory
-    // fsync must not cause callers to roll back an already-committed provider write.
+    // Publication is the commit point; not all platforms support directory fsync.
     let _ = directory.sync_all();
     Ok(())
 }
@@ -571,7 +554,7 @@ pub fn init(p: &Paths, recipient: &str) -> Result<()> {
             version: VERSION,
             recipient: recipient.to_string(),
             config: String::new(),
-            providers: BTreeMap::new(),
+            legacy_providers: BTreeMap::new(),
             keys: BTreeMap::new(),
         },
         recipient,
@@ -598,6 +581,12 @@ fn mutate(p: &Paths, f: impl FnOnce(&mut Vault) -> Result<()>) -> Result<()> {
     let path = p.repo.join(FILE);
     let (_, mut snapshot) = snapshot_file(&path)?;
     f(&mut snapshot.vault)?;
+    snapshot.vault.version = VERSION;
+    snapshot.vault.legacy_providers.retain(|label, _| {
+        snapshot.vault.keys.values().any(
+            |key| matches!(&key.source, Source::Provider { provider, .. } if provider == label),
+        )
+    });
     atomic_write(&path, seal(&snapshot)?.as_bytes(), true)
 }
 
@@ -634,7 +623,10 @@ fn acceptable_algorithm(algorithm: Algorithm) -> bool {
 
 impl Vault {
     fn validate(&self) -> Result<()> {
-        ensure!(self.version == VERSION, "unsupported vault schema version");
+        ensure!(
+            matches!(self.version, 1 | VERSION),
+            "unsupported vault schema version"
+        );
         ensure!(
             self.config.len() <= MAX_CONFIG
                 && !self
@@ -643,17 +635,10 @@ impl Vault {
                     .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')),
             "invalid vault SSH configuration"
         );
-        for (name, provider) in &self.providers {
-            ensure!(
-                valid_label(name) && name != "age",
-                "invalid or reserved provider label"
-            );
-            provider.validate()?;
-        }
         let mut fingerprints = BTreeSet::new();
         for (name, key) in &self.keys {
             ensure!(valid_label(name), "invalid key label");
-            key.validate(&self.providers)?;
+            key.validate(self)?;
             ensure!(
                 fingerprints.insert(&key.fingerprint),
                 "vault contains a duplicate SSH key fingerprint"
@@ -676,125 +661,51 @@ impl Vault {
     }
 }
 
-impl Provider {
-    fn validate(&self) -> Result<()> {
-        let valid = match self {
-            Provider::Bitwarden(config) => {
-                [&config.folder, &config.collection, &config.organization_id]
-                    .into_iter()
-                    .flatten()
-                    .all(|value| valid_reference(value) && valid_bw_value(value.as_str()))
-                    && (!matches!(config.backend, Some(BitwardenBackend::Rbw))
-                        || (config.collection.is_none() && config.organization_id.is_none()))
-            }
-            Provider::Keychain(config) => {
-                valid_reference(&config.service)
-                    && config.prefix.as_ref().is_none_or(valid_reference)
-            }
-        };
-        ensure!(valid, "invalid provider settings");
-        Ok(())
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Bitwarden(_) => "bitwarden",
-            Self::Keychain(_) => "keychain",
-        }
-    }
-
-    fn read(&self, reference: &Secret) -> Result<Zeroizing<Vec<u8>>> {
-        self.validate_reference(reference)?;
-        let isolated = Fnox::new()?;
-        let mut command = isolated.command(Path::new("/dev/fd/0"), None);
-        let error = match self {
-            Self::Bitwarden(settings) => {
-                match settings.backend.unwrap_or(BitwardenBackend::Bw) {
-                    BitwardenBackend::Bw => {
-                        let session = env::var_os("FNOX_BW_SESSION")
-                        .filter(|value| !value.is_empty())
-                        .or_else(|| env::var_os("BW_SESSION").filter(|value| !value.is_empty()))
-                        .context("unlock Bitwarden with bw and set BW_SESSION before resolving this key")?;
-                        command.env("BW_SESSION", session);
-                        if let Some(profile) = env::var_os("BITWARDENCLI_APPDATA_DIR") {
-                            command.env("BITWARDENCLI_APPDATA_DIR", profile);
-                        }
-                        "could not read Bitwarden entry; check the reference and that your bw session is unlocked"
-                    }
-                    BitwardenBackend::Rbw => {
-                        for name in [
-                            "RBW_PROFILE",
-                            "XDG_CONFIG_HOME",
-                            "XDG_CACHE_HOME",
-                            "XDG_STATE_HOME",
-                        ] {
-                            if let Some(value) = env::var_os(name) {
-                                command.env(name, value);
-                            }
-                        }
-                        "could not read Bitwarden entry; check the reference and run rbw unlock"
-                    }
-                }
-            }
-            Self::Keychain(_) => {
-                "could not read Keychain entry; check the entry and your OS credential store"
-            }
-        };
-        let config = provider_config(self, reference.as_str())?;
-        let mut data = isolated
-            .get_command(command, config.as_bytes(), MAX_KEY + 1)
-            .context(error)?;
-        if data.last() == Some(&b'\n') {
-            data.pop(); // `fnox get` adds one newline to its result.
-        }
-        Ok(data)
-    }
-
-    fn validate_reference(&self, reference: &Secret) -> Result<()> {
-        ensure!(valid_reference(reference), "invalid provider reference");
-        if matches!(self, Self::Bitwarden(_)) {
-            let reference = reference.as_str();
-            let (name, field) = reference.split_once('/').unwrap_or((reference, "password"));
-            ensure!(
-                valid_bw_value(name) && valid_bw_value(field),
-                "invalid Bitwarden reference"
-            );
-        }
-        Ok(())
-    }
+fn validate_secret_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= MAX_REFERENCE && !name.chars().any(char::is_control),
+        "invalid fnox secret name"
+    );
+    Ok(())
 }
 
-fn valid_bw_value(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty() && !value.starts_with('-')
-}
-
-fn provider_config(provider: &Provider, reference: &str) -> Result<Zeroizing<String>> {
-    #[derive(Serialize)]
-    struct Config<'a> {
-        providers: BTreeMap<&'static str, &'a Provider>,
-        secrets: BTreeMap<&'static str, Entry<'a>>,
-    }
-    #[derive(Serialize)]
-    struct Entry<'a> {
-        provider: &'static str,
-        value: &'a str,
-        env: bool,
-    }
-    let config = Config {
-        providers: BTreeMap::from([("external", provider)]),
-        secrets: BTreeMap::from([(
-            "SSHP_VAULT",
-            Entry {
-                provider: "external",
-                value: reference,
-                env: false,
-            },
-        )]),
+fn resolve_fnox_key(secret: &str) -> Result<PrivateKey> {
+    validate_secret_name(secret)?;
+    // Only the name travels in the vault. Config (including imports/plugins),
+    // profile selection and provider credentials are local to this client.
+    let config = match env::var_os("SSHP_FNOX_CONFIG") {
+        Some(path) => PathBuf::from(path),
+        None => env::var_os("XDG_CONFIG_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(crate::home()?.join(".config"))
+            .join("sshp/fnox.toml"),
     };
-    toml::to_string(&config)
-        .map(Zeroizing::new)
-        .map_err(|_| anyhow!("could not encode provider settings"))
+    ensure!(
+        config.is_absolute() && config.is_file(),
+        "external keys need a local fnox config: set SSHP_FNOX_CONFIG to an absolute file or create ~/.config/sshp/fnox.toml"
+    );
+    let mut cmd = Command::new(env::var_os("SSHP_FNOX_BIN").unwrap_or_else(|| "fnox".into()));
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        cmd.arg("--non-interactive")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    cmd.current_dir(config.parent().context("invalid fnox config path")?)
+        .args(["--no-daemon", "--no-color", "--config"])
+        .arg(&config)
+        .args(["get", "--if-missing", "error", "--", secret]);
+    let mut data = Fnox::run(&mut cmd, None, MAX_KEY + 1)
+        .context("fnox key lookup failed; check the local config, profile and provider login")?;
+    if data.last() == Some(&b'\n') {
+        data.pop(); // fnox get appends a newline.
+    }
+    let key = parse_private(&data)?;
+    ensure!(
+        !key.is_encrypted(),
+        "fnox secret must contain a private key without an SSH passphrase"
+    );
+    Ok(key)
 }
 
 impl Key {
@@ -808,7 +719,7 @@ impl Key {
         })
     }
 
-    fn validate(&self, providers: &BTreeMap<String, Provider>) -> Result<()> {
+    fn validate(&self, vault: &Vault) -> Result<()> {
         let public = PublicKey::from_openssh(&self.public)
             .map_err(|_| anyhow!("invalid public key in vault"))?;
         let (canonical, fingerprint) = public_metadata(&public)?;
@@ -832,15 +743,16 @@ impl Key {
                 );
                 self.check_material(&key)?;
             }
+            Source::Fnox { secret } => validate_secret_name(secret)?,
             Source::Provider {
                 provider,
                 reference,
-            } => {
-                providers
-                    .get(provider)
-                    .context("key references an unknown provider")?
-                    .validate_reference(reference)?;
-            }
+            } => ensure!(
+                valid_label(provider)
+                    && vault.legacy_providers.contains_key(provider)
+                    && valid_reference(reference),
+                "invalid legacy key reference"
+            ),
         }
         Ok(())
     }
@@ -854,18 +766,12 @@ impl Key {
         Ok(())
     }
 
-    fn material(&self, providers: &BTreeMap<String, Provider>) -> Result<Identity> {
+    fn material(&self) -> Result<Identity> {
         let key = match &self.source {
             Source::Age { pem } => parse_private(pem.as_str().as_bytes())?,
-            Source::Provider {
-                provider,
-                reference,
-            } => {
-                let bytes = providers
-                    .get(provider)
-                    .context("unknown key provider")?
-                    .read(reference)?;
-                parse_private(&bytes)?
+            Source::Fnox { secret } => resolve_fnox_key(secret)?,
+            Source::Provider { .. } => {
+                bail!("legacy provider key; use sshp key relink LABEL --fnox-secret NAME")
             }
         };
         ensure!(
@@ -949,15 +855,13 @@ fn normalized_pem(mut key: PrivateKey) -> Result<Zeroizing<String>> {
 }
 
 pub fn unlock_material(p: &Paths) -> Result<(String, Vec<Identity>)> {
-    let Vault {
-        config,
-        keys,
-        providers,
-        ..
-    } = load(p)?;
+    let Vault { config, keys, .. } = load(p)?;
     let keys = keys
-        .into_values()
-        .map(|key| key.material(&providers))
+        .into_iter()
+        .map(|(name, key)| {
+            key.material()
+                .with_context(|| format!("could not unlock key {name}"))
+        })
         .collect::<Result<_>>()?;
     Ok((config, keys))
 }
@@ -968,33 +872,6 @@ pub enum VaultCommand {
     Export { file: PathBuf },
     /// Verify and atomically install an encrypted vault. Use - for stdin.
     Import { file: PathBuf },
-    /// Configure external key providers.
-    Provider {
-        #[command(subcommand)]
-        command: ProviderCommand,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum ProviderCommand {
-    /// Configure a read-only Bitwarden provider using bw or rbw.
-    SetBitwarden {
-        name: String,
-        /// Read optional backend, folder, collection and organization_id TOML settings from stdin.
-        #[arg(long)]
-        config_stdin: bool,
-    },
-    /// Configure an OS Keychain provider.
-    SetKeychain {
-        name: String,
-        /// Read service and optional prefix TOML settings from stdin instead of prompting.
-        #[arg(long)]
-        config_stdin: bool,
-    },
-    /// List provider labels and types only.
-    List,
-    /// Delete an unused provider configuration.
-    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1004,28 +881,20 @@ pub enum KeyCommand {
         name: String,
         file: PathBuf,
         /// Read the key passphrase from stdin instead of using a hidden prompt.
-        #[arg(long, conflicts_with = "reference_stdin")]
-        passphrase_stdin: bool,
-        /// Create a new entry in this provider instead of saving the key in age.
-        ///
-        /// Supported by macOS Keychain and an unlocked Linux Secret Service
-        /// collection. If interrupted before the vault is saved, the new
-        /// provider entry may need to be removed separately.
         #[arg(long)]
-        provider: Option<String>,
-        /// Read the destination entry reference from stdin instead of using a hidden prompt.
-        #[arg(long, requires = "provider")]
-        reference_stdin: bool,
+        passphrase_stdin: bool,
     },
-    /// Register an existing key from a configured provider.
-    #[command(alias = "reference")]
+    /// Register a named secret from the local fnox config and pin its public key.
     Add {
         name: String,
         #[arg(long)]
-        provider: String,
-        /// Read the entry reference from stdin instead of using a hidden prompt.
+        fnox_secret: String,
+    },
+    /// Move an existing label to a fnox secret with the same public key; keep its hosts.
+    Relink {
+        name: String,
         #[arg(long)]
-        reference_stdin: bool,
+        fnox_secret: String,
     },
     /// List key labels, fingerprints, hosts, and source types (not references).
     List,
@@ -1070,73 +939,7 @@ pub fn vault_cmd(p: &Paths, command: VaultCommand) -> Result<()> {
             ensure_repo_directory(p, true)?;
             atomic_write(&p.repo.join(FILE), &bytes, true)
         }
-        VaultCommand::Provider { command } => provider_cmd(p, command),
     }
-}
-
-fn provider_cmd(p: &Paths, command: ProviderCommand) -> Result<()> {
-    match command {
-        ProviderCommand::List => {
-            let vault = load(p)?;
-            let mut out = io::stdout().lock();
-            for (name, provider) in &vault.providers {
-                writeln!(out, "{name}\t{}", provider.kind())?;
-            }
-            Ok(())
-        }
-        ProviderCommand::Delete { name } => mutate(p, |vault| {
-            ensure!(
-                !vault.keys.values().any(|key| {
-                    matches!(&key.source, Source::Provider { provider, .. } if provider == &name)
-                }),
-                "provider is in use"
-            );
-            vault.providers.remove(&name).context("unknown provider")?;
-            Ok(())
-        }),
-        ProviderCommand::SetBitwarden { name, config_stdin } => {
-            let config = if config_stdin {
-                settings_stdin()?
-            } else {
-                Bitwarden::default()
-            };
-            set_provider(p, name, Provider::Bitwarden(config))
-        }
-        ProviderCommand::SetKeychain { name, config_stdin } => {
-            let config = if config_stdin {
-                settings_stdin()?
-            } else {
-                Keychain {
-                    service: Secret(hidden("Keychain service: ", false, MAX_REFERENCE)?),
-                    prefix: None,
-                }
-            };
-            set_provider(p, name, Provider::Keychain(config))
-        }
-    }
-}
-
-fn set_provider(p: &Paths, name: String, provider: Provider) -> Result<()> {
-    mutate(p, |vault| {
-        ensure!(
-            valid_label(&name) && name != "age",
-            "invalid or reserved provider label"
-        );
-        ensure!(
-            !vault.keys.values().any(|key| {
-                matches!(&key.source, Source::Provider { provider, .. } if provider == &name)
-            }),
-            "cannot change a provider that is in use"
-        );
-        vault.providers.insert(name, provider);
-        Ok(())
-    })
-}
-
-fn settings_stdin<T: DeserializeOwned>() -> Result<T> {
-    let bytes = bounded_read(io::stdin().lock(), MAX_PROVIDER_CONFIG, "provider settings")?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow!("invalid provider settings"))?;
-    toml::from_str(text).map_err(|_| anyhow!("invalid provider settings"))
 }
 
 fn hidden(prompt: &str, stdin: bool, max: usize) -> Result<Zeroizing<String>> {
@@ -1157,12 +960,6 @@ fn hidden(prompt: &str, stdin: bool, max: usize) -> Result<Zeroizing<String>> {
     ensure!(bytes.len() <= max, "hidden input is too large");
     let text = std::str::from_utf8(&bytes).map_err(|_| anyhow!("hidden input must be UTF-8"))?;
     Ok(Zeroizing::new(text.to_owned()))
-}
-
-fn read_reference(stdin: bool) -> Result<Secret> {
-    let reference = Secret(hidden("Provider reference: ", stdin, MAX_REFERENCE)?);
-    ensure!(valid_reference(&reference), "invalid provider reference");
-    Ok(reference)
 }
 
 fn read_private(file: &Path, passphrase_stdin: bool) -> Result<PrivateKey> {
@@ -1204,63 +1001,44 @@ pub fn key_cmd(p: &Paths, command: KeyCommand) -> Result<()> {
             name,
             file,
             passphrase_stdin,
-            provider,
-            reference_stdin,
         } => {
-            ensure!(
-                !(file == Path::new("-") && reference_stdin),
-                "key and provider reference cannot both be read from stdin"
-            );
             let key = read_private(&file, passphrase_stdin)?;
-            if let Some(provider) = provider {
-                let reference = read_reference(reference_stdin)?;
-                import_provider(p, name, provider, reference, key)
-            } else {
-                let (public, fingerprint) = public_metadata(key.public_key())?;
-                let pem = Secret(normalized_pem(key)?);
-                mutate(p, |vault| {
-                    let key = Key {
-                        public,
-                        fingerprint,
-                        hosts: Vec::new(),
-                        source: Source::Age { pem },
-                    };
-                    vault.new_key(&name, &key)?;
-                    vault.keys.insert(name, key);
-                    Ok(())
-                })
-            }
-        }
-        KeyCommand::Add {
-            name,
-            provider,
-            reference_stdin,
-        } => {
-            let reference = read_reference(reference_stdin)?;
+            let (public, fingerprint) = public_metadata(key.public_key())?;
+            let pem = Secret(normalized_pem(key)?);
             mutate(p, |vault| {
-                ensure!(
-                    valid_label(&name) && !vault.keys.contains_key(&name),
-                    "invalid or existing key label"
-                );
-                let bytes = vault
-                    .providers
-                    .get(&provider)
-                    .context("unknown key provider")?
-                    .read(&reference)?;
-                let material = parse_private(&bytes)?;
-                ensure!(
-                    !material.is_encrypted(),
-                    "provider SSH key must not be passphrase-protected"
-                );
-                let key = Key::from_material(
-                    &material,
-                    Source::Provider {
-                        provider,
-                        reference,
-                    },
-                )?;
+                let key = Key {
+                    public,
+                    fingerprint,
+                    hosts: Vec::new(),
+                    source: Source::Age { pem },
+                };
                 vault.new_key(&name, &key)?;
                 vault.keys.insert(name, key);
+                Ok(())
+            })
+        }
+        KeyCommand::Add { name, fnox_secret } => {
+            let material = resolve_fnox_key(&fnox_secret)?;
+            let key = Key::from_material(
+                &material,
+                Source::Fnox {
+                    secret: fnox_secret,
+                },
+            )?;
+            mutate(p, |vault| {
+                vault.new_key(&name, &key)?;
+                vault.keys.insert(name, key);
+                Ok(())
+            })
+        }
+        KeyCommand::Relink { name, fnox_secret } => {
+            let material = resolve_fnox_key(&fnox_secret)?;
+            mutate(p, |vault| {
+                let key = vault.keys.get_mut(&name).context("unknown key")?;
+                key.check_material(&material)?;
+                key.source = Source::Fnox {
+                    secret: fnox_secret,
+                };
                 Ok(())
             })
         }
@@ -1270,10 +1048,8 @@ pub fn key_cmd(p: &Paths, command: KeyCommand) -> Result<()> {
             for (name, key) in &vault.keys {
                 let source = match &key.source {
                     Source::Age { .. } => "encrypted in Git (age)",
-                    Source::Provider { provider, .. } => match &vault.providers[provider] {
-                        Provider::Bitwarden(_) => "external provider (bitwarden)",
-                        Provider::Keychain(_) => "external provider (keychain)",
-                    },
+                    Source::Fnox { .. } => "external (fnox)",
+                    Source::Provider { .. } => "legacy (needs key relink)",
                 };
                 writeln!(
                     out,
@@ -1318,175 +1094,6 @@ fn associate(p: &Paths, name: &str, hosts: Vec<String>, add: bool) -> Result<()>
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn import_provider(
-    p: &Paths,
-    name: String,
-    provider: String,
-    reference: Secret,
-    material: PrivateKey,
-) -> Result<()> {
-    let _lock = p.lock_repo()?;
-    ensure_repo_directory(p, false)?;
-    let path = p.repo.join(FILE);
-    let (_, mut snapshot) = snapshot_file(&path)?;
-    let settings = match snapshot
-        .vault
-        .providers
-        .get(&provider)
-        .context("unknown key provider")?
-    {
-        Provider::Keychain(settings) => settings,
-        Provider::Bitwarden(_) => {
-            bail!("Bitwarden is read-only; store the key there, then use key add")
-        }
-    };
-    let key = Key::from_material(
-        &material,
-        Source::Provider {
-            provider,
-            reference,
-        },
-    )?;
-    snapshot.vault.new_key(&name, &key)?;
-    let pem = normalized_pem(material)?;
-    let Source::Provider { reference, .. } = &key.source else {
-        unreachable!()
-    };
-    let target = settings.target(reference.as_str());
-    snapshot.vault.keys.insert(name, key);
-    let encrypted = seal(&snapshot)?;
-    target.create_and_commit(pem.as_bytes(), || {
-        atomic_write(&path, encrypted.as_bytes(), true)
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn import_provider(
-    _p: &Paths,
-    _name: String,
-    _provider: String,
-    _reference: Secret,
-    _material: PrivateKey,
-) -> Result<()> {
-    bail!(
-        "external key writes require macOS Keychain or a Linux Secret Service; store the key separately, then use key add"
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-struct KeychainTarget {
-    service: Zeroizing<String>,
-    account: Zeroizing<String>,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-impl Keychain {
-    fn target(&self, reference: &str) -> KeychainTarget {
-        let mut account = Zeroizing::new(String::new());
-        if let Some(prefix) = &self.prefix {
-            account.push_str(prefix.as_str());
-        }
-        account.push_str(reference);
-        KeychainTarget {
-            service: self.service.0.clone(),
-            account,
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl KeychainTarget {
-    fn create_and_commit(&self, pem: &[u8], commit: impl FnOnce() -> Result<()>) -> Result<()> {
-        use security_framework::os::macos::keychain::SecKeychain;
-        let keychain =
-            SecKeychain::default().map_err(|_| anyhow!("default Keychain is unavailable"))?;
-        keychain
-            .add_generic_password(&self.service, &self.account, pem)
-            .map_err(|_| anyhow!("could not create Keychain entry (it may already exist)"))?;
-        complete_provider_write(commit, || self.delete(&keychain))
-    }
-
-    fn delete(
-        &self,
-        keychain: &security_framework::os::macos::keychain::SecKeychain,
-    ) -> Result<()> {
-        let (password, item) = keychain
-            .find_generic_password(&self.service, &self.account)
-            .map_err(|_| anyhow!("could not locate newly created Keychain entry"))?;
-        drop(password);
-        item.delete();
-        ensure!(
-            keychain
-                .find_generic_password(&self.service, &self.account)
-                .is_err_and(|e| e.code() == -25300),
-            "could not remove Keychain entry"
-        );
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl KeychainTarget {
-    fn create_and_commit(&self, pem: &[u8], commit: impl FnOnce() -> Result<()>) -> Result<()> {
-        use secret_service::{EncryptionType, blocking::SecretService};
-        use std::collections::HashMap;
-
-        let ss = SecretService::connect(EncryptionType::Dh)
-            .map_err(|_| anyhow!("Linux Secret Service is unavailable; start a credential store in your D-Bus session"))?;
-        let collection = ss
-            .get_default_collection()
-            .map_err(|_| anyhow!("Linux Secret Service has no default credential collection"))?;
-        ensure!(
-            !collection
-                .is_locked()
-                .map_err(|_| anyhow!("could not read Linux Secret Service collection status"))?,
-            "the Linux Secret Service default collection is locked"
-        );
-        // Match the attributes used by fnox's Linux keychain backend.
-        let attrs = HashMap::from([
-            ("service", self.service.as_str()),
-            ("username", self.account.as_str()),
-        ]);
-        let matching = ss
-            .search_items(attrs.clone())
-            .map_err(|_| anyhow!("could not check for existing Linux Secret Service entries"))?;
-        ensure!(
-            matching.locked.is_empty() && matching.unlocked.is_empty(),
-            "Keychain entry already exists; use key add to reference it"
-        );
-        let item = collection
-            .create_item(
-                "sshp SSH private key",
-                attrs,
-                pem,
-                false,
-                "application/octet-stream",
-            )
-            .map_err(|_| anyhow!("could not create Linux Secret Service entry"))?;
-        complete_provider_write(commit, || {
-            item.delete()
-                .map_err(|_| anyhow!("could not remove newly created Linux Secret Service entry"))
-        })
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn complete_provider_write(
-    commit: impl FnOnce() -> Result<()>,
-    rollback: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if let Err(error) = commit() {
-        return if rollback().is_ok() {
-            Err(error)
-        } else {
-            Err(error
-                .context("vault was not updated; the new Keychain item could not be rolled back"))
-        };
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1498,7 +1105,7 @@ mod tests {
                 version: VERSION,
                 recipient: recipient.to_string(),
                 config: "Host demo\n  HostName example.test\n".into(),
-                providers: BTreeMap::new(),
+                legacy_providers: BTreeMap::new(),
                 keys: BTreeMap::new(),
             },
             recipient,
@@ -1567,16 +1174,18 @@ mod tests {
     fn strict_encrypted_schema_and_literal_host_associations() {
         let snap = example(x25519::Identity::generate().to_public());
         let text = serde_json::to_string(&snap.vault).unwrap();
-        let text = text.replace(
-            r#""providers":{}"#,
-            r#""providers":{"test":{"type":"keychain","service":"test","auth_command":"must-not-run"}}"#,
+        assert!(
+            serde_json::from_str::<Vault>(
+                &text.replace("\"keys\":", "\"fnox_config\":\"/untrusted\",\"keys\":")
+            )
+            .is_err()
         );
-        assert!(serde_json::from_str::<Vault>(&text).is_err());
-        let text = text.replace(
-            r#""test":{"type":"keychain","service":"test","auth_command":"must-not-run"}"#,
-            r#""test":{"type":"bitwarden"},"test":{"type":"keychain","service":"test"}"#,
+        assert!(
+            serde_json::from_str::<Source>(
+                r#"{"type":"fnox","secret":"KEY","config":"/untrusted"}"#
+            )
+            .is_err()
         );
-        assert!(serde_json::from_str::<Vault>(&text).is_err());
         assert!(valid_host("test-alias_1.example"));
         for invalid in [
             "-option",
@@ -1618,6 +1227,13 @@ mod tests {
             result.err().unwrap().to_string(),
             "declared age recipient does not match the encrypted vault record"
         );
+
+        // Both claims agree, but neither is the local recipient. Simply
+        // decrypting the record successfully must not authorize future writes.
+        let mut envelope = fake_envelope(&data, &[identity.to_public()]);
+        envelope.providers.age.recipients = [false_claim.recipient.to_string()];
+        let forged = toml::to_string(&envelope).unwrap();
+        assert!(open_snapshot_with_identity(forged.as_bytes(), || Ok(path.path().into())).is_err());
     }
 
     #[test]
@@ -1633,22 +1249,5 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-    }
-
-    #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn failed_vault_publication_rolls_back_new_provider_entry() {
-        let rolled_back = std::cell::Cell::new(false);
-        let error = complete_provider_write(
-            || bail!("fixture publication failure"),
-            || {
-                rolled_back.set(true);
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert!(rolled_back.get());
-        assert_eq!(error.to_string(), "fixture publication failure");
-        complete_provider_write(|| Ok(()), || panic!("must not delete a published entry")).unwrap();
     }
 }

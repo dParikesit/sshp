@@ -81,6 +81,31 @@ directives twice. Move the portion you intend to manage out of the active
 file yourself after verifying the round trip. Don't reimport sshp's own
 runtime Include into the managed configuration.
 
+### Protect an existing vault with a passphrase
+
+Protect **the existing age identity**, not `vault.toml`. The recipient stays
+the same, so the vault, its Git history and all imported SSH keys stay as they
+are. With `FNOX_AGE_KEY_FILE` pointing at your current plaintext identity,
+run this in a terminal to create a protected copy (refuses to overwrite):
+
+```sh
+(umask 077; set -C; age -p "$FNOX_AGE_KEY_FILE" > "$FNOX_AGE_KEY_FILE.age") &&
+  export FNOX_AGE_KEY_FILE="$FNOX_AGE_KEY_FILE.age"
+```
+
+Run `sshp key list` and verify your existing fingerprints. To try the full
+cycle, run `sshp agent start`, `sshp agent lock`, then `sshp agent unlock`.
+fnox prompts for the identity passphrase in the terminal. It decrypts the
+identity in memory; sshp verifies the recipient and loads the agent without
+creating a plaintext identity file. An unattended unlock with a protected
+identity fails rather than waiting for a passphrase on stdin.
+
+Once verified, persist the new `FNOX_AGE_KEY_FILE` path in your shell
+configuration and back up the protected identity separately from the vault.
+Any remaining plaintext copy of the old identity can still open the vault
+without a passphrase. Regular SSH signing and agent lock never require the
+passphrase; management commands that reopen the vault can prompt again.
+
 ## How OpenSSH chooses settings
 
 The wrapper `exec`s `/usr/bin/ssh` with the original argument vector, file
@@ -193,32 +218,59 @@ file or an existing external item.
 
 * **Stored encrypted in Git** (default): the age record includes the SSH key.
   Restore with the ciphertext and its authorized native X25519 age identity.
-* **External provider reference**: only the provider settings, item reference,
-  public fingerprint and associations go into the age record. Supply access to
-  the same provider on each machine. Unlock checks that the fetched key matches
-  the pinned fingerprint. Bitwarden Password Manager is read-only.
+* **External fnox secret**: the vault contains a logical secret name, public
+  key, fingerprint and host associations. fnox owns the provider, item
+  reference and authentication. Any provider (including an installed fnox
+  plugin) that can return an OpenSSH private key through `fnox get` works.
+  Write-only destinations and sign-only hardware keys cannot supply key bytes.
+
+### Use a key from fnox
+
+Configure a [fnox provider](https://fnox.jdx.dev/providers/overview) on your machine
+and define a secret such as `WORK_SSH` in its config. The secret must resolve
+to the **contents** of an Ed25519 or RSA OpenSSH private key without an SSH
+passphrase (`as_file` must be off). Use `env = false` on the secret to keep
+fnox shell activation from exporting it. Point sshp at that trusted config:
 
 ```sh
-sshp vault provider set-bitwarden passwords
-sshp key add work --provider passwords        # enter the existing item reference
+export SSHP_FNOX_CONFIG="$HOME/.config/sshp/fnox.toml"
+sshp key add work --fnox-secret WORK_SSH
 sshp key associate work work-box
-sshp vault provider set-keychain local        # prompts for the keychain service
-sshp key add laptop --provider local          # reference an existing entry
-sshp key import new-key ./id_ed25519 --provider local   # create a keychain item
+sshp agent start
+sshp agent unlock
 ```
 
-Bitwarden uses fnox's Password Manager provider, not Bitwarden Secrets
-Manager. Authenticate `bw` separately and provide its unlocked session
-(`BW_SESSION` or `FNOX_BW_SESSION`); use a reference such as `Work key/notes`
-for a PEM stored in a secure note. Upstream fnox passes the session token to
-`bw` as a command argument. To avoid that, configure fnox's `rbw` backend
-with `printf 'backend = "rbw"\n' | sshp vault provider set-bitwarden passwords --config-stdin`
-and run `rbw unlock` separately. External entries are expected
-to contain an OpenSSH private key without an additional SSH-key passphrase;
-the encrypted-file import path handles passphrase-protected source files.
-Keychain access requires an available OS credential store; a local keychain
-item on one machine is not transferred by Git. Use `sshp key --help` and
-`sshp vault provider --help` for these commands.
+The default is `$XDG_CONFIG_HOME/sshp/fnox.toml` (usually the path above).
+Set `SSHP_FNOX_CONFIG` to an absolute path to use an existing config instead.
+Set `FNOX_PROFILE` if needed. The management client runs `fnox get` with your
+normal provider credentials, imports and plugins. A terminal allows fnox's
+authentication prompts; scripts run non-interactively and need credentials
+provisioned first. Keep the config outside the synced
+vault: a clone must not choose which fnox config your machine executes.
+
+For a writable provider you can provision the secret with fnox itself, e.g.
+`fnox --config "$SSHP_FNOX_CONFIG" set WORK_SSH --provider my_store --from-file ./id_ed25519`.
+For read-only providers, configure a reference to an existing item instead.
+Each machine may use a different backend for `WORK_SSH`; registration pins the
+public key and unlock rejects a mismatch. The running agent never calls fnox
+to sign. Deleting a key from sshp does not change the external item.
+
+### Upgrade from the per-provider CLI
+
+Existing age-stored keys and SSH configuration need no migration. Upgrade all
+clients before editing: the first vault edit writes schema v2. To keep a
+pre-upgrade snapshot, use `sshp vault export backup.toml` before editing.
+`sshp key list` marks old external keys as `legacy (needs key relink)`.
+Define each existing item as a secret in your local fnox config, then run:
+
+```sh
+sshp key relink work --fnox-secret WORK_SSH
+```
+
+Relinking checks the existing fingerprint before changing anything and keeps
+the label and hosts. Repeat for each legacy key before unlocking. This also
+works to move an age-stored key to a provider after provisioning the same key
+there; it does not remove the key from older encrypted backups or Git history.
 
 `sshp vault export backup.toml` creates an encrypted standalone snapshot;
 `sshp vault import backup.toml` validates it with your age identity before
@@ -226,7 +278,7 @@ replacing the working file. Neither command requires Git. Back up provider
 items separately. The portable file uses one fixed fnox record name independent
 of its contents. The public recipient, ciphertext size, Git author and history
 are not secret; host names, labels, public fingerprints, references and keys
-are inside the encrypted payload. The `plain` provider is not supported.
+are inside the encrypted payload. The portable vault itself always uses age.
 
 ## Synchronization and recovery
 
@@ -273,8 +325,7 @@ through a home-dependent version-manager shim, set `SSHP_TEST_FNOX` to the
 real installed executable; similarly, `SSHP_TEST_AGE_KEYGEN` selects
 `age-keygen`. `--agent-only` skips tests requiring a server.
 
-`bash tests/secret-service.sh` additionally exercises native Linux keychain
-creation, fnox resolution, and stock `ssh-add -T` using an isolated
-`dbus-run-session` and `gnome-keyring-daemon`. The main interoperability suite
-uses the real fnox Bitwarden provider with a fixture `bw` executable; it
-doesn't require or access a personal Bitwarden account.
+`bash tests/secret-service.sh` additionally exercises `fnox set` and `get` with
+a private Linux keyring and stock `ssh-add -T`. The main suite resolves one
+secret name across two machines using different fnox providers, tests missing
+and changed keys, and migrates a v1 external key without a personal account.
