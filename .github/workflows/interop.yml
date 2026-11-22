@@ -1,0 +1,47 @@
+name: OpenSSH interoperability
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fixture tools
+        shell: bash
+        run: |
+          set -eu
+          rustup update stable --no-self-update
+          rustup default stable
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/arm64)   target=aarch64-apple-darwin; sha=cf8301a5355c3249284b4102c871b0c4b5e5924cd7b61397f7539f4328041eff ;;
+            Darwin/x86_64)  target=x86_64-apple-darwin; sha=76bd810eaecdce2e02fcbe51deda070e72dcf85c216d746512c469f4012e7f72 ;;
+            Linux/x86_64)   target=x86_64-unknown-linux-gnu; sha=f08da606e120c676fc3a4f3def970a4ade82e3857841a3961afbdd337a88e30b ;;
+            *) exit 1 ;;
+          esac
+          if [ "$(uname -s)" = Darwin ]; then
+            brew install age
+          else
+            sudo apt-get update -q
+            sudo apt-get install -y age openssh-server dbus-daemon gnome-keyring
+            sudo mkdir -p /run/sshd
+          fi
+          cd "$RUNNER_TEMP"
+          curl -fsSL "https://github.com/jdx/fnox/releases/download/v1.50.0/fnox-$target.tar.gz" -o fnox.tar.gz
+          echo "$sha  fnox.tar.gz" | shasum -a 256 -c -
+          mkdir fnox-dist fixture-bin
+          tar -C fnox-dist -xzf fnox.tar.gz
+          install "$(find fnox-dist -type f -name fnox)" fixture-bin/
+          echo "$RUNNER_TEMP/fixture-bin" >> "$GITHUB_PATH"
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: python3 tests/acceptance.py
+      - if: runner.os == 'Linux'
+        run: bash tests/secret-service.sh

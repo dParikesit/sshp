@@ -1,0 +1,29 @@
+[package]
+name = "sshp"
+version = "0.1.0"
+edition = "2024"
+description = "Encrypted OpenSSH configuration and signing agent"
+default-run = "sshp"
+
+[dependencies]
+age = "0.11"
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+ratatui = "0.29"
+rpassword = "7"
+rsa = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh-key = { version = "0.6.7", features = ["rsa", "ed25519", "encryption", "getrandom"] }
+tempfile = "3"
+toml = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", features = ["rt-async-io-crypto-rust"] }
